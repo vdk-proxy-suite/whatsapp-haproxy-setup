@@ -1,0 +1,57 @@
+install:
+  minimum_version: "2.8"
+
+server:
+  public_ip: "203.0.113.10"
+  listen_ip: "0.0.0.0"
+  manage_ufw: false
+
+ports:
+  chat: 443
+  media: 587
+
+access:
+  # Empty means public access. CIDRs may be added for a private deployment.
+  allowed_cidrs: []
+
+limits:
+  global_connections: 64
+  global_connection_rate_per_second: 30
+  tls_connections: 32
+  tls_rate_per_second: 15
+  chat_connections: 32
+  media_connections: 48
+  per_ip_connections: 16
+  per_ip_connection_rate: 30
+  per_ip_rate_period_seconds: 10
+  stick_table_size: "100k"
+  stick_table_expire: "10m"
+  backlog: 64
+
+timeouts:
+  connect: "5s"
+  check: "5s"
+  queue: "3s"
+  client: "200s"
+  server: "200s"
+  client_fin: "1s"
+  server_fin: "1s"
+
+keepalive:
+  idle: "120s"
+  interval: "30s"
+  count: 3
+
+certificate:
+  dns_names: []
+  validity_days: 3650
+  ca_validity_days: 36500
+  regenerate_on_setup: false
+
+probes:
+  timeout_seconds: 8
+  admin_socket: "/run/haproxy/admin.sock"
+  chat_upstream_host: "g.whatsapp.net"
+  chat_upstream_port: 5222
+  media_upstream_host: "whatsapp.net"
+  media_upstream_port: 443

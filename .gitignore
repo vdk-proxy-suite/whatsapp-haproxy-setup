@@ -1,0 +1,24 @@
+# Runtime configuration, certificates and keys
+config.yaml
+*.pem
+*.key
+*.crt
+.env
+.env.*
+!.env.example
+
+# Generated artifacts and local environments
+*.zip
+*.log
+*.pcap
+*.pcapng
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+
+# Editor and OS metadata
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
