@@ -10,10 +10,16 @@
 Схема совместима с рекомендацией официального проекта WhatsApp Proxy для
 неблагоприятных сетевых условий. VoIP официальным proxy не поддерживается.
 
+## Изменения версии 1.0.3
+
+- Production-профили `config.<ssh-alias>.yaml` и локальный `AGENTS.md`
+  исключаются из Git и standalone ZIP
+- Release builder исключает локальные окружения и runtime artifacts
+
 ## Быстрый запуск
 
 ```bash
-unzip whatsapp-haproxy-setup-standalone-1.0.2.zip
+unzip whatsapp-haproxy-setup-standalone-1.0.3.zip
 cd whatsapp-haproxy-setup
 cp config.example.yaml config.yaml
 nano config.yaml

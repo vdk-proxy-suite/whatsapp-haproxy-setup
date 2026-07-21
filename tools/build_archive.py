@@ -10,11 +10,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 VERSION = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
 OUTPUT = ROOT.parent / f"{ROOT.name}-standalone-{VERSION}.zip"
-EXCLUDES = {"config.yaml", "__pycache__", ".pytest_cache"}
+EXCLUDES = {"AGENTS.md", "__pycache__", ".pytest_cache", ".git", ".agents", "venv", ".venv"}
 
 
 def include(path: Path) -> bool:
-    return not any(part in EXCLUDES or part.endswith(".pyc") for part in path.parts)
+    if any(part in EXCLUDES or part.endswith(".pyc") for part in path.parts):
+        return False
+    return not (path.name.startswith("config") and path.suffix == ".yaml" and not path.name.endswith(".example.yaml"))
 
 
 def main() -> int:

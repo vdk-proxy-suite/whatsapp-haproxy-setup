@@ -1,5 +1,7 @@
 # Runtime configuration, certificates and keys
-config.yaml
+AGENTS.md
+config*.yaml
+!config.example.yaml
 *.pem
 *.key
 *.crt
