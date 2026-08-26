@@ -10,11 +10,57 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 VERSION = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
 OUTPUT = ROOT.parent / f"{ROOT.name}-standalone-{VERSION}.zip"
-EXCLUDES = {"AGENTS.md", "__pycache__", ".pytest_cache", ".git", ".agents", "venv", ".venv"}
+EXCLUDED_DIRS = {
+    ".agents",
+    ".git",
+    ".hypothesis",
+    ".idea",
+    ".mypy_cache",
+    ".nox",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    ".venv",
+    ".vscode",
+    "__pycache__",
+    "htmlcov",
+    "test-results",
+    "tests",
+    "tmp",
+    "venv",
+}
+EXCLUDED_NAMES = {
+    ".coverage",
+    ".DS_Store",
+    "AGENTS.md",
+    "Thumbs.db",
+    "coverage.xml",
+    "junit.xml",
+    "whatsapp-haproxy-e2e.json",
+}
+EXCLUDED_SUFFIXES = {
+    ".crt",
+    ".key",
+    ".log",
+    ".pcap",
+    ".pcapng",
+    ".pem",
+    ".pid",
+    ".pyc",
+    ".pyo",
+    ".sock",
+    ".swp",
+    ".tmp",
+    ".zip",
+}
 
 
 def include(path: Path) -> bool:
-    if any(part in EXCLUDES or part.endswith(".pyc") for part in path.parts):
+    if any(part in EXCLUDED_DIRS for part in path.parts):
+        return False
+    if path.name in EXCLUDED_NAMES or path.suffix.lower() in EXCLUDED_SUFFIXES:
+        return False
+    if path.name == ".env" or (path.name.startswith(".env.") and path.name != ".env.example"):
         return False
     return not (path.name.startswith("config") and path.suffix == ".yaml" and not path.name.endswith(".example.yaml"))
 

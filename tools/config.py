@@ -103,9 +103,36 @@ def validate(config: dict[str, Any], reject_example: bool = False) -> None:
             raise ValueError(f"{path} cannot be empty")
 
 
+def runtime_dns_options(host: Any) -> str:
+    try:
+        ipaddress.ip_address(str(host))
+    except ValueError:
+        return " resolvers whatsapp_dns resolve-prefer ipv4 init-addr last,none"
+    return ""
+
+
 def render_haproxy(config: dict[str, Any]) -> str:
     validate(config)
     g = lambda path: get_path(config, path)
+    chat_host = g("probes.chat_upstream_host")
+    media_host = g("probes.media_upstream_host")
+    chat_dns_options = runtime_dns_options(chat_host)
+    media_dns_options = runtime_dns_options(media_host)
+    resolver_lines: list[str] = []
+    if chat_dns_options or media_dns_options:
+        resolver_lines = [
+            "resolvers whatsapp_dns",
+            "    parse-resolv-conf",
+            "    resolve_retries 3",
+            "    timeout resolve 5s",
+            "    timeout retry 1s",
+            "    hold other 30s",
+            "    hold refused 30s",
+            "    hold nx 30s",
+            "    hold timeout 30s",
+            "    accepted_payload_size 4096",
+            "",
+        ]
     cidrs = g("access.allowed_cidrs")
     access_lines: list[str] = []
     if cidrs:
@@ -151,6 +178,7 @@ def render_haproxy(config: dict[str, Any]) -> str:
         f"    timeout client-fin {g('timeouts.client_fin')}",
         f"    timeout server-fin {g('timeouts.server_fin')}",
         "",
+        *resolver_lines,
         "backend abuse_table",
         f"    stick-table type ip size {g('limits.stick_table_size')} expire {g('limits.stick_table_expire')} store conn_cur,conn_rate({g('limits.per_ip_rate_period_seconds')}s)",
         "",
@@ -164,7 +192,7 @@ def render_haproxy(config: dict[str, Any]) -> str:
         "",
         "backend whatsapp_chat",
         "    default-server check inter 60s fastinter 2s downinter 5s rise 1 fall 3 observe layer4 send-proxy",
-        f"    server g_whatsapp_net_5222 {g('probes.chat_upstream_host')}:{g('probes.chat_upstream_port')}",
+        f"    server g_whatsapp_net_5222 {chat_host}:{g('probes.chat_upstream_port')}{chat_dns_options}",
         "",
         "frontend whatsapp_media",
         f"    bind {g('server.listen_ip')}:{g('ports.media')}",
@@ -175,7 +203,7 @@ def render_haproxy(config: dict[str, Any]) -> str:
         "",
         "backend whatsapp_media",
         "    default-server check inter 60s fastinter 2s downinter 5s rise 1 fall 3 observe layer4",
-        f"    server whatsapp_net_443 {g('probes.media_upstream_host')}:{g('probes.media_upstream_port')}",
+        f"    server whatsapp_net_443 {media_host}:{g('probes.media_upstream_port')}{media_dns_options}",
         "",
     ]
     return "\n".join(lines)

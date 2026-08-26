@@ -10,6 +10,15 @@
 Схема совместима с рекомендацией официального проекта WhatsApp Proxy для
 неблагоприятных сетевых условий. VoIP официальным proxy не поддерживается.
 
+## Изменения версии 1.1.0
+
+- HAProxy переразрешает DNS-имена chat- и media-upstream в runtime и
+  обновляет их IPv4-адреса без restart или reload
+- Внешняя YAML-схема не изменилась: конфигурации версии 1.0.3
+  продолжают работать без изменений
+- TLS termination и PROXY v1 для chat `443`, raw TCP passthrough для
+  media `587`, ACL, limits, timeouts и certificate lifecycle не изменились
+
 ## Изменения версии 1.0.3
 
 - Production-профили `config.<ssh-alias>.yaml` и локальный `AGENTS.md`
@@ -19,7 +28,7 @@
 ## Быстрый запуск
 
 ```bash
-unzip whatsapp-haproxy-setup-standalone-1.0.3.zip
+unzip whatsapp-haproxy-setup-standalone-1.1.0.zip
 cd whatsapp-haproxy-setup
 cp config.example.yaml config.yaml
 nano config.yaml
@@ -45,6 +54,38 @@ sudo ./setuphaproxy.sh 3  # systemd start и VM-side health-check
 ```bash
 sudo ./setuphaproxy.sh all --config /secure/path/whatsapp-proxy.yaml
 ```
+
+## Runtime DNS-ротация upstream
+
+HAProxy переразрешает `probes.chat_upstream_host` и
+`probes.media_upstream_host` через DNS-серверы VM. Список nameserver
+считывается из `/etc/resolv.conf` при start/reload HAProxy; если сам
+список изменился, HAProxy нужно reload/restart. `/etc/hosts` в этом
+маршруте не используется.
+
+Для каждого DNS-upstream действует следующая семантика:
+
+- Базовый интервал переразрешения — 5 секунд, когда нет другого триггера;
+  connection timeout health-check может запустить его раньше. Интервал задаёт
+  `timeout resolve`, а не authoritative DNS TTL и не `hold valid`
+- Текущий IPv4-адрес сохраняется, пока он присутствует в корректном
+  A-answer. Когда адрес исчезает из answer, HAProxy выбирает актуальный
+  адрес. Это autorenew адреса одного HAProxy server, а не round-robin
+  между всеми одновременно опубликованными A-records
+- Смена адреса сама по себе не переносит и не разрывает уже
+  установленные TCP-сессии. Новые сессии используют обновлённый адрес
+- Внутри неудачного цикла HAProxy делает до трёх DNS-попыток с
+  интервалом 1 секунда и принимает DNS-payload до 4096 байт
+- При `NXDOMAIN`, `REFUSED`, timeout и других DNS-ошибках HAProxy проверяет,
+  был ли valid answer за предыдущие 30 секунд. Если нет, соответствующий
+  server выводится из работы до нового корректного answer; затем его
+  готовность снова определяют L4 health-checks
+- `init-addr last,none` не делает libc fallback. Если прежнего state нет,
+  backend стартует без адреса и сам восстанавливается после успешного DNS-answer
+
+Если в upstream указан literal IPv4, HAProxy оставляет его статическим.
+Для перехода на 1.1.0 не нужно добавлять ключи в `config.yaml`: все текущие
+поля и их значения сохраняют прежнюю семантику.
 
 ## Cloud firewall и DDoS
 
