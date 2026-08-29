@@ -13,6 +13,7 @@ import yaml
 TIMEOUT_RE = re.compile(r"^[1-9][0-9]*(ms|s|m|h)$")
 SIZE_RE = re.compile(r"^[1-9][0-9]*[kKmMgG]?$" )
 EXAMPLE_IP = "203.0.113.10"
+DNS_SERVER_SLOTS = 16
 
 
 def load_config(path: str) -> dict[str, Any]:
@@ -107,8 +108,18 @@ def runtime_dns_options(host: Any) -> str:
     try:
         ipaddress.ip_address(str(host))
     except ValueError:
-        return " resolvers whatsapp_dns resolve-prefer ipv4 init-addr last,none"
+        return (
+            " resolvers whatsapp_dns resolve-prefer ipv4"
+            " resolve-opts prevent-dup-ip init-addr last,none"
+        )
     return ""
+
+
+def render_backend_server(name: str, host: Any, port: Any) -> str:
+    dns_options = runtime_dns_options(host)
+    if dns_options:
+        return f"    server-template {name} {DNS_SERVER_SLOTS} {host}:{port}{dns_options}"
+    return f"    server {name} {host}:{port}"
 
 
 def render_haproxy(config: dict[str, Any]) -> str:
@@ -130,6 +141,7 @@ def render_haproxy(config: dict[str, Any]) -> str:
             "    hold refused 30s",
             "    hold nx 30s",
             "    hold timeout 30s",
+            "    hold obsolete 15m",
             "    accepted_payload_size 4096",
             "",
         ]
@@ -191,8 +203,9 @@ def render_haproxy(config: dict[str, Any]) -> str:
         "    default_backend whatsapp_chat",
         "",
         "backend whatsapp_chat",
-        "    default-server check inter 60s fastinter 2s downinter 5s rise 1 fall 3 observe layer4 send-proxy",
-        f"    server g_whatsapp_net_5222 {chat_host}:{g('probes.chat_upstream_port')}{chat_dns_options}",
+        "    balance leastconn",
+        "    default-server check inter 10s fastinter 2s downinter 30s rise 1 fall 2 observe layer4 send-proxy",
+        render_backend_server("g_whatsapp_net_5222", chat_host, g("probes.chat_upstream_port")),
         "",
         "frontend whatsapp_media",
         f"    bind {g('server.listen_ip')}:{g('ports.media')}",
@@ -202,8 +215,9 @@ def render_haproxy(config: dict[str, Any]) -> str:
         "    default_backend whatsapp_media",
         "",
         "backend whatsapp_media",
-        "    default-server check inter 60s fastinter 2s downinter 5s rise 1 fall 3 observe layer4",
-        f"    server whatsapp_net_443 {media_host}:{g('probes.media_upstream_port')}{media_dns_options}",
+        "    balance leastconn",
+        "    default-server check inter 10s fastinter 2s downinter 30s rise 1 fall 2 observe layer4",
+        render_backend_server("whatsapp_net_443", media_host, g("probes.media_upstream_port")),
         "",
     ]
     return "\n".join(lines)

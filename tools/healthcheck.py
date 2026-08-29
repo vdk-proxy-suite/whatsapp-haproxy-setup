@@ -99,32 +99,88 @@ def admin_command(path: str, value: str, timeout: float) -> str:
     return b"".join(chunks).decode("utf-8", "replace")
 
 
-def admin_stats(path: str, timeout: float) -> dict[str, Any]:
+def _is_template_slot(server: str, prefix: str) -> bool:
+    if not server.startswith(prefix):
+        return False
+    suffix = server[len(prefix):]
+    return suffix.isascii() and suffix.isdigit() and int(suffix) > 0
+
+
+def _stats_upstreams(config: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if config is not None:
+        return _configured_upstreams(config)
+    return [
+        {"backend": backend, "server": server, "literal": None}
+        for _label, backend, server, _path in UPSTREAM_SERVERS
+    ]
+
+
+def inspect_admin_stats(config: dict[str, Any] | None, text: str) -> dict[str, Any]:
+    rows = list(csv.DictReader(text.splitlines()))
+    selected: dict[str, Any] = {}
+    unavailable: list[str] = []
+
+    for upstream in _stats_upstreams(config):
+        backend = str(upstream["backend"])
+        server = str(upstream["server"])
+        literal = upstream["literal"]
+        matched: list[dict[str, str]] = []
+
+        for row in rows:
+            px = (row.get("# pxname") or row.get("pxname") or "").lstrip("# ")
+            sv = row.get("svname") or ""
+            if px != backend:
+                continue
+            if literal is not None:
+                server_matches = sv == server
+            elif config is None:
+                # Preserve support for reports produced by the pre-pool release.
+                server_matches = sv == server or _is_template_slot(sv, server)
+            else:
+                server_matches = _is_template_slot(sv, server)
+            if server_matches:
+                matched.append(row)
+
+        if not matched:
+            mode = "static server" if literal is not None else "server-template pool"
+            raise RuntimeError(f"HAProxy stats are missing {mode} {backend}/{server}")
+
+        statuses: dict[str, str | None] = {}
+        has_up = False
+        for row in matched:
+            sv = str(row.get("svname") or "")
+            status = row.get("status")
+            statuses[sv] = status
+            has_up = has_up or str(status).startswith("UP")
+            selected[f"{backend}/{sv}"] = {
+                "status": status,
+                "check_status": row.get("check_status"),
+            }
+
+        if not has_up:
+            unavailable.append(
+                f"{backend} has no UP server "
+                f"({', '.join(f'{name}={status}' for name, status in statuses.items())})"
+            )
+
+    if unavailable:
+        raise RuntimeError("; ".join(unavailable))
+    return selected
+
+
+def admin_stats(path: str, timeout: float, config: dict[str, Any] | None = None) -> dict[str, Any]:
     deadline = time.monotonic() + timeout
-    last: dict[str, Any] = {}
     last_error: Exception | None = None
     while time.monotonic() < deadline:
         try:
             text = admin_command(path, "show stat", min(2.0, timeout))
-            rows = list(csv.DictReader(text.splitlines()))
-            selected = {}
-            for row in rows:
-                px = (row.get("# pxname") or row.get("pxname") or "").lstrip("# ")
-                sv = row.get("svname") or ""
-                if (px, sv) in {
-                    ("whatsapp_chat", "g_whatsapp_net_5222"),
-                    ("whatsapp_media", "whatsapp_net_443"),
-                }:
-                    selected[f"{px}/{sv}"] = {"status": row.get("status"), "check_status": row.get("check_status")}
-            last = selected
-            if len(selected) == 2 and all(str(value["status"]).startswith("UP") for value in selected.values()):
-                return selected
+            return inspect_admin_stats(config, text)
         except Exception as exc:
             last_error = exc
         time.sleep(0.5)
-    if last_error and not last:
+    if last_error is not None:
         raise last_error
-    raise RuntimeError(f"backend servers are not both UP: {last}")
+    raise RuntimeError("backend servers did not become UP before timeout")
 
 
 def parse_resolver_stats(text: str, section: str = DNS_RESOLVER_SECTION) -> dict[str, Any]:
@@ -219,8 +275,21 @@ def _configured_upstreams(config: dict[str, Any]) -> list[dict[str, Any]]:
             "server": server,
             "host": host,
             "literal": literal,
+            "mode": "static" if literal is not None else "dns_pool",
         })
     return upstreams
+
+
+def _runtime_address(raw_address: str, server: str, allow_unassigned: bool) -> ipaddress.IPv4Address | None:
+    if allow_unassigned and raw_address in {"", "-", "0.0.0.0"}:
+        return None
+    try:
+        address = ipaddress.ip_address(raw_address)
+    except ValueError as exc:
+        raise RuntimeError(f"HAProxy server {server} has invalid address {raw_address!r}") from exc
+    if not isinstance(address, ipaddress.IPv4Address) or address.is_unspecified:
+        raise RuntimeError(f"HAProxy server {server} has no usable IPv4 address")
+    return address
 
 
 def inspect_runtime_dns(
@@ -228,48 +297,81 @@ def inspect_runtime_dns(
 ) -> dict[str, Any]:
     upstreams = _configured_upstreams(config)
     version, rows = parse_server_state(server_state_text)
-    indexed = {(row["be_name"], row["srv_name"]): row for row in rows}
     servers: list[dict[str, Any]] = []
+    backends: dict[str, dict[str, Any]] = {}
     hostname_upstreams: set[str] = set()
 
     for upstream in upstreams:
-        key = (str(upstream["backend"]), str(upstream["server"]))
-        if key not in indexed:
-            raise RuntimeError(f"HAProxy server state is missing {key[0]}/{key[1]}")
-        row = indexed[key]
-        raw_address = row["srv_addr"]
-        try:
-            address = ipaddress.ip_address(raw_address)
-        except ValueError as exc:
-            raise RuntimeError(f"HAProxy server {key[0]}/{key[1]} has invalid address {raw_address!r}") from exc
-        if not isinstance(address, ipaddress.IPv4Address) or address.is_unspecified:
-            raise RuntimeError(f"HAProxy server {key[0]}/{key[1]} has no usable IPv4 address")
-
+        backend = str(upstream["backend"])
+        server = str(upstream["server"])
         literal = upstream["literal"]
-        fqdn = None if row["srv_fqdn"] in {"", "-"} else row["srv_fqdn"]
-        if literal is not None:
-            if not isinstance(literal, ipaddress.IPv4Address):
-                raise RuntimeError(f"configured upstream {upstream['host']!r} is not an IPv4 address")
-            if address != literal:
-                raise RuntimeError(
-                    f"HAProxy server {key[0]}/{key[1]} uses {address}, expected literal {literal}"
-                )
-        else:
-            expected_fqdn = str(upstream["host"]).rstrip(".").lower()
-            if fqdn is None or fqdn.rstrip(".").lower() != expected_fqdn:
-                raise RuntimeError(
-                    f"HAProxy server {key[0]}/{key[1]} has FQDN {fqdn!r}, expected {upstream['host']!r}"
-                )
+        matching_rows = [
+            row for row in rows
+            if row["be_name"] == backend and (
+                row["srv_name"] == server if literal is not None
+                else _is_template_slot(row["srv_name"], server)
+            )
+        ]
+        if not matching_rows:
+            mode = "static server" if literal is not None else "server-template pool"
+            raise RuntimeError(f"HAProxy server state is missing {mode} {backend}/{server}")
+
+        if literal is not None and not isinstance(literal, ipaddress.IPv4Address):
+            raise RuntimeError(f"configured upstream {upstream['host']!r} is not an IPv4 address")
+
+        expected_fqdn = None if literal is not None else str(upstream["host"]).rstrip(".").lower()
+        if expected_fqdn is not None:
             hostname_upstreams.add(expected_fqdn)
 
-        servers.append({
-            "backend": key[0],
-            "server": key[1],
-            "configured_host": upstream["host"],
-            "fqdn": fqdn,
-            "address": str(address),
-            "operational_state": row["srv_op_state"],
-        })
+        assigned_addresses: set[ipaddress.IPv4Address] = set()
+        assigned = 0
+        up = 0
+        for row in matching_rows:
+            key = f"{backend}/{row['srv_name']}"
+            fqdn = None if row["srv_fqdn"] in {"", "-"} else row["srv_fqdn"]
+            address = _runtime_address(row["srv_addr"], key, allow_unassigned=literal is None)
+
+            if literal is not None:
+                if address != literal:
+                    raise RuntimeError(f"HAProxy server {key} uses {address}, expected literal {literal}")
+            else:
+                if fqdn is None or fqdn.rstrip(".").lower() != expected_fqdn:
+                    raise RuntimeError(
+                        f"HAProxy server {key} has FQDN {fqdn!r}, expected {upstream['host']!r}"
+                    )
+                if address is not None:
+                    if address in assigned_addresses:
+                        raise RuntimeError(f"HAProxy backend {backend} assigns duplicate IPv4 address {address}")
+                    assigned_addresses.add(address)
+
+            is_assigned = address is not None
+            is_up = is_assigned and row["srv_op_state"] == "2"
+            assigned += int(is_assigned)
+            up += int(is_up)
+            servers.append({
+                "backend": backend,
+                "server": row["srv_name"],
+                "configured_host": upstream["host"],
+                "fqdn": fqdn,
+                "address": str(address) if address is not None else None,
+                "assigned": is_assigned,
+                "operational_state": row["srv_op_state"],
+            })
+
+        if up == 0:
+            raise RuntimeError(
+                f"HAProxy backend {backend} has no assigned UP server: "
+                f"assigned={assigned}, slots={len(matching_rows)}"
+            )
+        backends[backend] = {
+            "mode": upstream["mode"],
+            "server_prefix": server,
+            "slots": len(matching_rows),
+            "assigned": assigned,
+            "up": up,
+            "down": assigned - up,
+            "unassigned": len(matching_rows) - assigned,
+        }
 
     resolver: dict[str, Any]
     if hostname_upstreams:
@@ -290,7 +392,12 @@ def inspect_runtime_dns(
             "skipped": "all configured upstreams are literal IPv4 addresses",
         }
 
-    return {"server_state_version": version, "resolver": resolver, "servers": servers}
+    return {
+        "server_state_version": version,
+        "resolver": resolver,
+        "backends": backends,
+        "servers": servers,
+    }
 
 
 def runtime_dns_state(config: dict[str, Any], path: str, timeout: float) -> dict[str, Any]:
@@ -359,11 +466,9 @@ def main() -> int:
         report.check("haproxy_config", lambda: command(["haproxy", "-c", "-f", "/etc/haproxy/haproxy.cfg"]))
         report.check("service_active", lambda: command(["systemctl", "is-active", "haproxy.service"]))
         report.check("service_enabled", lambda: command(["systemctl", "is-enabled", "haproxy.service"]))
-        report.check("chat_upstream_tcp", lambda: tcp_connect(str(g("probes.chat_upstream_host")), int(g("probes.chat_upstream_port")), timeout))
-        report.check("media_upstream_tls", lambda: tls_connect(str(g("probes.media_upstream_host")), int(g("probes.media_upstream_port")), str(g("probes.media_upstream_host")), timeout, True))
         report.check("local_chat_tls", lambda: tls_connect("127.0.0.1", int(g("ports.chat")), target, timeout, False))
         report.check("local_media_tls", lambda: tls_connect("127.0.0.1", int(g("ports.media")), str(g("probes.media_upstream_host")), timeout, True))
-        report.check("backend_stats", lambda: admin_stats(str(g("probes.admin_socket")), timeout))
+        report.check("backend_stats", lambda: admin_stats(str(g("probes.admin_socket")), timeout, config))
         report.check("backend_runtime_dns", lambda: runtime_dns_state(config, str(g("probes.admin_socket")), timeout))
     elif args.scope == "e2e":
         report.check("proxy_chat_tls", lambda: tls_connect(target, int(g("ports.chat")), target, timeout, False))
