@@ -19,7 +19,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from config import get_path, load_config, validate  # noqa: E402
 
 
-DNS_RESOLVER_SECTION = "whatsapp_dns"
+DNS_RESOLVER_VIEWS = ("system", "cloudflare", "google")
+DNS_RESOLVER_SECTIONS = tuple(
+    f"whatsapp_dns_{view}"
+    for view in DNS_RESOLVER_VIEWS
+)
 UPSTREAM_SERVERS = (
     ("chat", "whatsapp_chat", "g_whatsapp_net_5222", "probes.chat_upstream_host"),
     ("media", "whatsapp_media", "whatsapp_net_443", "probes.media_upstream_host"),
@@ -103,7 +107,14 @@ def _is_template_slot(server: str, prefix: str) -> bool:
     if not server.startswith(prefix):
         return False
     suffix = server[len(prefix):]
-    return suffix.isascii() and suffix.isdigit() and int(suffix) > 0
+    if suffix.isascii() and suffix.isdigit():
+        return int(suffix) > 0
+    for view in DNS_RESOLVER_VIEWS:
+        view_prefix = f"_{view}"
+        if suffix.startswith(view_prefix):
+            slot = suffix[len(view_prefix):]
+            return slot.isascii() and slot.isdigit() and int(slot) > 0
+    return False
 
 
 def _stats_upstreams(config: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -145,22 +156,28 @@ def inspect_admin_stats(config: dict[str, Any] | None, text: str) -> dict[str, A
             mode = "static server" if literal is not None else "server-template pool"
             raise RuntimeError(f"HAProxy stats are missing {mode} {backend}/{server}")
 
-        statuses: dict[str, str | None] = {}
-        has_up = False
+        statuses: dict[str, dict[str, str | None]] = {}
+        has_ready = False
         for row in matched:
             sv = str(row.get("svname") or "")
             status = row.get("status")
-            statuses[sv] = status
-            has_up = has_up or str(status).startswith("UP")
+            check_status = row.get("check_status")
+            statuses[sv] = {"status": status, "check_status": check_status}
+            has_ready = has_ready or (
+                str(status).strip() == "UP" and str(check_status).strip() == "L4OK"
+            )
             selected[f"{backend}/{sv}"] = {
                 "status": status,
-                "check_status": row.get("check_status"),
+                "check_status": check_status,
             }
 
-        if not has_up:
+        if not has_ready:
+            details = ", ".join(
+                f"{name}={value['status']}/{value['check_status']}"
+                for name, value in statuses.items()
+            )
             unavailable.append(
-                f"{backend} has no UP server "
-                f"({', '.join(f'{name}={status}' for name, status in statuses.items())})"
+                f"{backend} has no ready server ({details})"
             )
 
     if unavailable:
@@ -183,7 +200,10 @@ def admin_stats(path: str, timeout: float, config: dict[str, Any] | None = None)
     raise RuntimeError("backend servers did not become UP before timeout")
 
 
-def parse_resolver_stats(text: str, section: str = DNS_RESOLVER_SECTION) -> dict[str, Any]:
+def parse_resolver_stats(
+    text: str,
+    section: str = DNS_RESOLVER_SECTIONS[0],
+) -> dict[str, Any]:
     section_seen = False
     in_section = False
     nameservers: list[dict[str, Any]] = []
@@ -293,7 +313,9 @@ def _runtime_address(raw_address: str, server: str, allow_unassigned: bool) -> i
 
 
 def inspect_runtime_dns(
-    config: dict[str, Any], resolver_text: str | None, server_state_text: str,
+    config: dict[str, Any],
+    resolver_texts: dict[str, str] | None,
+    server_state_text: str,
 ) -> dict[str, Any]:
     upstreams = _configured_upstreams(config)
     version, rows = parse_server_state(server_state_text)
@@ -323,7 +345,6 @@ def inspect_runtime_dns(
         if expected_fqdn is not None:
             hostname_upstreams.add(expected_fqdn)
 
-        assigned_addresses: set[ipaddress.IPv4Address] = set()
         assigned = 0
         up = 0
         for row in matching_rows:
@@ -339,11 +360,6 @@ def inspect_runtime_dns(
                     raise RuntimeError(
                         f"HAProxy server {key} has FQDN {fqdn!r}, expected {upstream['host']!r}"
                     )
-                if address is not None:
-                    if address in assigned_addresses:
-                        raise RuntimeError(f"HAProxy backend {backend} assigns duplicate IPv4 address {address}")
-                    assigned_addresses.add(address)
-
             is_assigned = address is not None
             is_up = is_assigned and row["srv_op_state"] == "2"
             assigned += int(is_assigned)
@@ -373,28 +389,27 @@ def inspect_runtime_dns(
             "unassigned": len(matching_rows) - assigned,
         }
 
-    resolver: dict[str, Any]
+    resolvers: dict[str, dict[str, Any]] = {}
     if hostname_upstreams:
-        if resolver_text is None:
-            raise RuntimeError("HAProxy resolver state was not queried for hostname upstreams")
-        resolver = parse_resolver_stats(resolver_text)
+        if resolver_texts is None:
+            raise RuntimeError("HAProxy resolver states were not queried for hostname upstreams")
         expected_queries = len(hostname_upstreams)
-        if int(resolver["sent"]) < expected_queries or int(resolver["valid"]) < expected_queries:
-            raise RuntimeError(
-                f"resolver {DNS_RESOLVER_SECTION!r} has insufficient activity for "
-                f"{expected_queries} hostname upstream(s): sent={resolver['sent']}, valid={resolver['valid']}"
-            )
-        resolver["hostname_upstreams"] = sorted(hostname_upstreams)
-    else:
-        resolver = {
-            "section": DNS_RESOLVER_SECTION,
-            "hostname_upstreams": [],
-            "skipped": "all configured upstreams are literal IPv4 addresses",
-        }
+        for section in DNS_RESOLVER_SECTIONS:
+            if section not in resolver_texts:
+                raise RuntimeError(f"HAProxy resolver state was not queried for section {section!r}")
+            resolver = parse_resolver_stats(resolver_texts[section], section)
+            if int(resolver["sent"]) < expected_queries or int(resolver["valid"]) < expected_queries:
+                raise RuntimeError(
+                    f"resolver {section!r} has insufficient activity for "
+                    f"{expected_queries} hostname upstream(s): "
+                    f"sent={resolver['sent']}, valid={resolver['valid']}"
+                )
+            resolver["hostname_upstreams"] = sorted(hostname_upstreams)
+            resolvers[section] = resolver
 
     return {
         "server_state_version": version,
-        "resolver": resolver,
+        "resolvers": resolvers,
         "backends": backends,
         "servers": servers,
     }
@@ -408,12 +423,20 @@ def runtime_dns_state(config: dict[str, Any], path: str, timeout: float) -> dict
     while time.monotonic() < deadline:
         try:
             command_timeout = min(2.0, timeout)
-            resolver_text = (
-                admin_command(path, f"show resolvers {DNS_RESOLVER_SECTION}", command_timeout)
-                if has_hostname else None
+            resolver_texts = (
+                {
+                    section: admin_command(
+                        path,
+                        f"show resolvers {section}",
+                        command_timeout,
+                    )
+                    for section in DNS_RESOLVER_SECTIONS
+                }
+                if has_hostname
+                else None
             )
             server_state_text = admin_command(path, "show servers state", command_timeout)
-            return inspect_runtime_dns(config, resolver_text, server_state_text)
+            return inspect_runtime_dns(config, resolver_texts, server_state_text)
         except Exception as exc:
             last_error = exc
         time.sleep(0.5)
@@ -459,6 +482,7 @@ def main() -> int:
     validate(config)
     g = lambda path: get_path(config, path)
     timeout = float(g("probes.timeout_seconds"))
+    readiness_timeout = max(30.0, timeout * 4)
     target = args.host or str(g("server.public_ip"))
     report = Report(args.scope)
 
@@ -466,10 +490,16 @@ def main() -> int:
         report.check("haproxy_config", lambda: command(["haproxy", "-c", "-f", "/etc/haproxy/haproxy.cfg"]))
         report.check("service_active", lambda: command(["systemctl", "is-active", "haproxy.service"]))
         report.check("service_enabled", lambda: command(["systemctl", "is-enabled", "haproxy.service"]))
+        report.check(
+            "backend_stats",
+            lambda: admin_stats(str(g("probes.admin_socket")), readiness_timeout, config),
+        )
+        report.check(
+            "backend_runtime_dns",
+            lambda: runtime_dns_state(config, str(g("probes.admin_socket")), readiness_timeout),
+        )
         report.check("local_chat_tls", lambda: tls_connect("127.0.0.1", int(g("ports.chat")), target, timeout, False))
         report.check("local_media_tls", lambda: tls_connect("127.0.0.1", int(g("ports.media")), str(g("probes.media_upstream_host")), timeout, True))
-        report.check("backend_stats", lambda: admin_stats(str(g("probes.admin_socket")), timeout, config))
-        report.check("backend_runtime_dns", lambda: runtime_dns_state(config, str(g("probes.admin_socket")), timeout))
     elif args.scope == "e2e":
         report.check("proxy_chat_tls", lambda: tls_connect(target, int(g("ports.chat")), target, timeout, False))
         report.check("proxy_media_tls", lambda: tls_connect(target, int(g("ports.media")), str(g("probes.media_upstream_host")), timeout, True))

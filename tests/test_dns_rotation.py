@@ -923,6 +923,338 @@ class HAProxyDnsRotationIntegrationTests(unittest.TestCase):
             for listener in listeners:
                 listener.close()
 
+    def test_blocked_cold_start_fails_closed_then_recovers(self) -> None:
+        chat_a = media_a = None
+        try:
+            chat_a = _backend_at("127.0.0.2", 0, "chat-A", True)
+            media_a = _backend_at("127.0.0.2", 0, "media-A", False)
+        except OSError as exc:
+            for listener in (chat_a, media_a):
+                if listener is not None:
+                    listener.close()
+            self.skipTest(f"test loopback listeners are unavailable: {exc}")
+
+        dns = _FakeDnsServer("127.0.0.3")
+        process: subprocess.Popen[str] | None = None
+        try:
+            with tempfile.TemporaryDirectory(prefix="wa-haproxy-dns-cold-") as temporary:
+                temp = Path(temporary)
+                admin_socket = temp / "admin.sock"
+                config_path = temp / "haproxy.cfg"
+                chat_frontend = _free_port()
+                media_frontend = _free_port()
+                config_path.write_text(
+                    self._pool_config(
+                        admin_socket,
+                        dns.port,
+                        chat_frontend,
+                        media_frontend,
+                        chat_a.port,
+                        media_a.port,
+                        fall=2,
+                    ),
+                    encoding="utf-8",
+                    newline="\n",
+                )
+
+                validation = subprocess.run(
+                    [str(HAPROXY), "-c", "-f", str(config_path)],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(
+                    validation.returncode,
+                    0,
+                    validation.stdout + validation.stderr,
+                )
+                process = subprocess.Popen(
+                    [str(HAPROXY), "-db", "-f", str(config_path)],
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                )
+
+                def running_pid() -> int | None:
+                    if process is None:
+                        return None
+                    if process.poll() is not None:
+                        output = process.stdout.read() if process.stdout else ""
+                        raise AssertionError(f"HAProxy exited with {process.returncode}: {output}")
+                    if not admin_socket.exists():
+                        return None
+                    return _runtime_pid(admin_socket)
+
+                pid_before = _wait_until(running_pid, "HAProxy runtime socket")
+                self.assertEqual(pid_before, process.pid)
+                _wait_until(
+                    lambda: (
+                        _address_is_down(admin_socket, "chat_backend", "127.0.0.3")
+                        and _address_is_down(admin_socket, "media_backend", "127.0.0.3")
+                        and _backend_has_no_up_server(admin_socket, "chat_backend")
+                        and _backend_has_no_up_server(admin_socket, "media_backend")
+                    ),
+                    "sole cold-start address B to fail two L4 checks",
+                    timeout=15,
+                )
+                _wait_until(
+                    lambda: _frontend_is_unavailable(chat_frontend),
+                    "chat frontend to fail closed at cold start",
+                )
+                _wait_until(
+                    lambda: _frontend_is_unavailable(media_frontend),
+                    "media frontend to fail closed at cold start",
+                )
+                self.assertEqual(_runtime_pid(admin_socket), pid_before)
+
+                dns.rotate("127.0.0.2")
+                _wait_until(
+                    lambda: (
+                        _address_is_up(admin_socket, "chat_backend", "127.0.0.2")
+                        and _address_is_up(admin_socket, "media_backend", "127.0.0.2")
+                    ),
+                    "reachable address A to recover both cold-start pools",
+                    timeout=15,
+                )
+
+                chat_payload = b"chat-after-cold-start-recovery\n"
+                media_payload = b"media-after-cold-start-recovery\n"
+                chat_client, chat_marker = _connect(chat_frontend, chat_payload)
+                media_client, media_marker = _connect(media_frontend, media_payload)
+                try:
+                    self.assertEqual(chat_marker, b"chat-A\n")
+                    self.assertEqual(media_marker, b"media-A\n")
+                finally:
+                    chat_client.close()
+                    media_client.close()
+
+                chat_record = _wait_until(
+                    lambda: _record_with(chat_a, chat_payload),
+                    "chat payload after cold-start recovery",
+                )
+                media_record = _wait_until(
+                    lambda: _record_with(media_a, media_payload),
+                    "media payload after cold-start recovery",
+                )
+                self.assertTrue(chat_record.startswith(b"PROXY TCP4 "), chat_record)
+                self.assertIn(b"\r\n" + chat_payload, chat_record)
+                self.assertEqual(media_record, media_payload)
+                self.assertFalse(media_record.startswith(b"PROXY "))
+                self.assertEqual(_runtime_pid(admin_socket), pid_before)
+                self.assertIsNone(process.poll())
+        finally:
+            if process is not None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+                if process.stdout is not None:
+                    process.stdout.close()
+            dns.close()
+            chat_a.close()
+            media_a.close()
+
+    def test_divergent_resolver_views_keep_reachable_candidates(self) -> None:
+        chat_a = media_a = None
+        try:
+            chat_a = _backend_at("127.0.0.2", 0, "chat-A", True)
+            media_a = _backend_at("127.0.0.2", 0, "media-A", False)
+        except OSError as exc:
+            for listener in (chat_a, media_a):
+                if listener is not None:
+                    listener.close()
+            self.skipTest(f"test loopback listeners are unavailable: {exc}")
+
+        blocked_dns = _FakeDnsServer("127.0.0.3")
+        reachable_dns = _FakeDnsServer("127.0.0.2")
+        process: subprocess.Popen[str] | None = None
+        try:
+            with tempfile.TemporaryDirectory(prefix="wa-haproxy-dns-views-") as temporary:
+                temp = Path(temporary)
+                admin_socket = temp / "admin.sock"
+                config_path = temp / "haproxy.cfg"
+                chat_frontend = _free_port()
+                media_frontend = _free_port()
+                config_path.write_text(
+                    self._divergent_resolver_config(
+                        admin_socket,
+                        blocked_dns.port,
+                        reachable_dns.port,
+                        chat_frontend,
+                        media_frontend,
+                        chat_a.port,
+                        media_a.port,
+                    ),
+                    encoding="utf-8",
+                    newline="\n",
+                )
+
+                validation = subprocess.run(
+                    [str(HAPROXY), "-c", "-f", str(config_path)],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(
+                    validation.returncode,
+                    0,
+                    validation.stdout + validation.stderr,
+                )
+                process = subprocess.Popen(
+                    [str(HAPROXY), "-db", "-f", str(config_path)],
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                )
+
+                def running_pid() -> int | None:
+                    if process is None:
+                        return None
+                    if process.poll() is not None:
+                        output = process.stdout.read() if process.stdout else ""
+                        raise AssertionError(f"HAProxy exited with {process.returncode}: {output}")
+                    if not admin_socket.exists():
+                        return None
+                    return _runtime_pid(admin_socket)
+
+                pid_before = _wait_until(running_pid, "HAProxy runtime socket")
+                self.assertEqual(pid_before, process.pid)
+                _wait_until(
+                    lambda: (
+                        _address_is_down(admin_socket, "chat_backend", "127.0.0.3")
+                        and _address_is_down(admin_socket, "media_backend", "127.0.0.3")
+                        and _address_is_up(admin_socket, "chat_backend", "127.0.0.2")
+                        and _address_is_up(admin_socket, "media_backend", "127.0.0.2")
+                    ),
+                    "divergent resolver candidates to settle by L4 reachability",
+                    timeout=15,
+                )
+
+                chat_payload = b"chat-through-reachable-resolver-view\n"
+                media_payload = b"media-through-reachable-resolver-view\n"
+                chat_client, chat_marker = _connect(chat_frontend, chat_payload)
+                media_client, media_marker = _connect(media_frontend, media_payload)
+                try:
+                    self.assertEqual(chat_marker, b"chat-A\n")
+                    self.assertEqual(media_marker, b"media-A\n")
+                finally:
+                    chat_client.close()
+                    media_client.close()
+
+                chat_record = _wait_until(
+                    lambda: _record_with(chat_a, chat_payload),
+                    "chat payload through reachable resolver view",
+                )
+                media_record = _wait_until(
+                    lambda: _record_with(media_a, media_payload),
+                    "media payload through reachable resolver view",
+                )
+                self.assertTrue(chat_record.startswith(b"PROXY TCP4 "), chat_record)
+                self.assertIn(b"\r\n" + chat_payload, chat_record)
+                self.assertEqual(media_record, media_payload)
+                self.assertFalse(media_record.startswith(b"PROXY "))
+                self.assertEqual(_runtime_pid(admin_socket), pid_before)
+                self.assertIsNone(process.poll())
+
+                for dns in (blocked_dns, reachable_dns):
+                    queries = dns.queries()
+                    self.assertTrue(
+                        any(
+                            name == dns.CHAT_ALIAS and query_type == 1
+                            for name, query_type in queries
+                        )
+                    )
+                    self.assertTrue(
+                        any(
+                            name == dns.MEDIA_NAME and query_type == 1
+                            for name, query_type in queries
+                        )
+                    )
+        finally:
+            if process is not None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+                if process.stdout is not None:
+                    process.stdout.close()
+            blocked_dns.close()
+            reachable_dns.close()
+            chat_a.close()
+            media_a.close()
+
+    @staticmethod
+    def _divergent_resolver_config(
+        admin_socket: Path,
+        blocked_dns_port: int,
+        reachable_dns_port: int,
+        chat_frontend: int,
+        media_frontend: int,
+        chat_backend: int,
+        media_backend: int,
+    ) -> str:
+        return f"""global
+    stats socket {admin_socket} mode 600 level admin
+    maxconn 64
+
+defaults
+    mode tcp
+    timeout connect 1s
+    timeout client 15s
+    timeout server 15s
+    timeout check 500ms
+
+resolvers blocked_dns
+    nameserver local 127.0.0.1:{blocked_dns_port}
+    resolve_retries 2
+    timeout resolve 200ms
+    timeout retry 100ms
+    hold valid 200ms
+    hold obsolete 3s
+    hold other 1s
+    hold refused 1s
+    hold nx 1s
+    hold timeout 1s
+    accepted_payload_size 4096
+
+resolvers reachable_dns
+    nameserver local 127.0.0.1:{reachable_dns_port}
+    resolve_retries 2
+    timeout resolve 200ms
+    timeout retry 100ms
+    hold valid 200ms
+    hold obsolete 3s
+    hold other 1s
+    hold refused 1s
+    hold nx 1s
+    hold timeout 1s
+    accepted_payload_size 4096
+
+frontend chat_frontend
+    bind 127.0.0.1:{chat_frontend}
+    default_backend chat_backend
+
+backend chat_backend
+    balance leastconn
+    default-server check inter 200ms fastinter 100ms downinter 100ms rise 1 fall 2 observe layer4
+    server-template chat_blocked 2 { _FakeDnsServer.CHAT_ALIAS }:{chat_backend} send-proxy resolvers blocked_dns resolve-prefer ipv4 resolve-opts prevent-dup-ip init-addr last,none
+    server-template chat_reachable 2 { _FakeDnsServer.CHAT_ALIAS }:{chat_backend} send-proxy resolvers reachable_dns resolve-prefer ipv4 resolve-opts prevent-dup-ip init-addr last,none
+
+frontend media_frontend
+    bind 127.0.0.1:{media_frontend}
+    default_backend media_backend
+
+backend media_backend
+    balance leastconn
+    default-server check inter 200ms fastinter 100ms downinter 100ms rise 1 fall 2 observe layer4
+    server-template media_blocked 2 { _FakeDnsServer.MEDIA_NAME }:{media_backend} resolvers blocked_dns resolve-prefer ipv4 resolve-opts prevent-dup-ip init-addr last,none
+    server-template media_reachable 2 { _FakeDnsServer.MEDIA_NAME }:{media_backend} resolvers reachable_dns resolve-prefer ipv4 resolve-opts prevent-dup-ip init-addr last,none
+"""
+
     @staticmethod
     def _pool_config(
         admin_socket: Path,
@@ -931,6 +1263,7 @@ class HAProxyDnsRotationIntegrationTests(unittest.TestCase):
         media_frontend: int,
         chat_backend: int,
         media_backend: int,
+        fall: int = 1,
     ) -> str:
         return f"""global
     stats socket {admin_socket} mode 600 level admin
@@ -962,7 +1295,7 @@ frontend chat_frontend
 
 backend chat_backend
     balance leastconn
-    default-server check inter 200ms fastinter 100ms downinter 100ms rise 1 fall 1 observe layer4
+    default-server check inter 200ms fastinter 100ms downinter 100ms rise 1 fall {fall} observe layer4
     server-template chat_server 4 { _FakeDnsServer.CHAT_ALIAS }:{chat_backend} send-proxy resolvers test_dns resolve-prefer ipv4 resolve-opts prevent-dup-ip init-addr last,none
 
 frontend media_frontend
@@ -971,7 +1304,7 @@ frontend media_frontend
 
 backend media_backend
     balance leastconn
-    default-server check inter 200ms fastinter 100ms downinter 100ms rise 1 fall 1 observe layer4
+    default-server check inter 200ms fastinter 100ms downinter 100ms rise 1 fall {fall} observe layer4
     server-template media_server 4 { _FakeDnsServer.MEDIA_NAME }:{media_backend} resolvers test_dns resolve-prefer ipv4 resolve-opts prevent-dup-ip init-addr last,none
 """
 

@@ -13,7 +13,12 @@ import yaml
 TIMEOUT_RE = re.compile(r"^[1-9][0-9]*(ms|s|m|h)$")
 SIZE_RE = re.compile(r"^[1-9][0-9]*[kKmMgG]?$" )
 EXAMPLE_IP = "203.0.113.10"
-DNS_SERVER_SLOTS = 16
+DNS_SERVER_SLOTS_PER_RESOLVER = 4
+DNS_RESOLVERS = (
+    ("system", "whatsapp_dns_system"),
+    ("cloudflare", "whatsapp_dns_cloudflare"),
+    ("google", "whatsapp_dns_google"),
+)
 
 
 def load_config(path: str) -> dict[str, Any]:
@@ -104,22 +109,25 @@ def validate(config: dict[str, Any], reject_example: bool = False) -> None:
             raise ValueError(f"{path} cannot be empty")
 
 
-def runtime_dns_options(host: Any) -> str:
+def uses_runtime_dns(host: Any) -> bool:
     try:
         ipaddress.ip_address(str(host))
     except ValueError:
-        return (
-            " resolvers whatsapp_dns resolve-prefer ipv4"
+        return True
+    return False
+
+
+def render_backend_servers(name: str, host: Any, port: Any) -> list[str]:
+    if not uses_runtime_dns(host):
+        return [f"    server {name} {host}:{port}"]
+    return [
+        (
+            f"    server-template {name}_{view} {DNS_SERVER_SLOTS_PER_RESOLVER} {host}:{port}"
+            f" resolvers {resolver} resolve-prefer ipv4"
             " resolve-opts prevent-dup-ip init-addr last,none"
         )
-    return ""
-
-
-def render_backend_server(name: str, host: Any, port: Any) -> str:
-    dns_options = runtime_dns_options(host)
-    if dns_options:
-        return f"    server-template {name} {DNS_SERVER_SLOTS} {host}:{port}{dns_options}"
-    return f"    server {name} {host}:{port}"
+        for view, resolver in DNS_RESOLVERS
+    ]
 
 
 def render_haproxy(config: dict[str, Any]) -> str:
@@ -127,13 +135,38 @@ def render_haproxy(config: dict[str, Any]) -> str:
     g = lambda path: get_path(config, path)
     chat_host = g("probes.chat_upstream_host")
     media_host = g("probes.media_upstream_host")
-    chat_dns_options = runtime_dns_options(chat_host)
-    media_dns_options = runtime_dns_options(media_host)
+    uses_dns = uses_runtime_dns(chat_host) or uses_runtime_dns(media_host)
     resolver_lines: list[str] = []
-    if chat_dns_options or media_dns_options:
+    if uses_dns:
         resolver_lines = [
-            "resolvers whatsapp_dns",
+            "resolvers whatsapp_dns_system",
             "    parse-resolv-conf",
+            "    resolve_retries 3",
+            "    timeout resolve 5s",
+            "    timeout retry 1s",
+            "    hold other 30s",
+            "    hold refused 30s",
+            "    hold nx 30s",
+            "    hold timeout 30s",
+            "    hold obsolete 15m",
+            "    accepted_payload_size 4096",
+            "",
+            "resolvers whatsapp_dns_cloudflare",
+            "    nameserver cloudflare_primary 1.1.1.1:53",
+            "    nameserver cloudflare_secondary 1.0.0.1:53",
+            "    resolve_retries 3",
+            "    timeout resolve 5s",
+            "    timeout retry 1s",
+            "    hold other 30s",
+            "    hold refused 30s",
+            "    hold nx 30s",
+            "    hold timeout 30s",
+            "    hold obsolete 15m",
+            "    accepted_payload_size 4096",
+            "",
+            "resolvers whatsapp_dns_google",
+            "    nameserver google_primary 8.8.8.8:53",
+            "    nameserver google_secondary 8.8.4.4:53",
             "    resolve_retries 3",
             "    timeout resolve 5s",
             "    timeout retry 1s",
@@ -205,7 +238,7 @@ def render_haproxy(config: dict[str, Any]) -> str:
         "backend whatsapp_chat",
         "    balance leastconn",
         "    default-server check inter 10s fastinter 2s downinter 30s rise 1 fall 2 observe layer4 send-proxy",
-        render_backend_server("g_whatsapp_net_5222", chat_host, g("probes.chat_upstream_port")),
+        *render_backend_servers("g_whatsapp_net_5222", chat_host, g("probes.chat_upstream_port")),
         "",
         "frontend whatsapp_media",
         f"    bind {g('server.listen_ip')}:{g('ports.media')}",
@@ -217,7 +250,7 @@ def render_haproxy(config: dict[str, Any]) -> str:
         "backend whatsapp_media",
         "    balance leastconn",
         "    default-server check inter 10s fastinter 2s downinter 30s rise 1 fall 2 observe layer4",
-        render_backend_server("whatsapp_net_443", media_host, g("probes.media_upstream_port")),
+        *render_backend_servers("whatsapp_net_443", media_host, g("probes.media_upstream_port")),
         "",
     ]
     return "\n".join(lines)

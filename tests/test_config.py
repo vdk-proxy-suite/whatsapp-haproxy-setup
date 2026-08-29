@@ -29,32 +29,43 @@ class HAProxyRenderTests(unittest.TestCase):
 
         rendered = render_haproxy(self.config)
 
-        self.assertIn(
-            "resolvers whatsapp_dns\n"
-            "    parse-resolv-conf\n"
-            "    resolve_retries 3\n"
-            "    timeout resolve 5s\n"
-            "    timeout retry 1s\n"
-            "    hold other 30s\n"
-            "    hold refused 30s\n"
-            "    hold nx 30s\n"
-            "    hold timeout 30s\n"
-            "    hold obsolete 15m\n"
-            "    accepted_payload_size 4096",
-            rendered,
-        )
+        system_resolver = section(rendered, "resolvers whatsapp_dns_system")
+        cloudflare_resolver = section(rendered, "resolvers whatsapp_dns_cloudflare")
+        google_resolver = section(rendered, "resolvers whatsapp_dns_google")
+
+        self.assertIn("parse-resolv-conf", system_resolver)
+        self.assertNotIn("nameserver", system_resolver)
+        self.assertIn("nameserver cloudflare_primary 1.1.1.1:53", cloudflare_resolver)
+        self.assertIn("nameserver cloudflare_secondary 1.0.0.1:53", cloudflare_resolver)
+        self.assertNotIn("parse-resolv-conf", cloudflare_resolver)
+        self.assertNotIn("8.8.8.8", cloudflare_resolver)
+        self.assertIn("nameserver google_primary 8.8.8.8:53", google_resolver)
+        self.assertIn("nameserver google_secondary 8.8.4.4:53", google_resolver)
+        self.assertNotIn("parse-resolv-conf", google_resolver)
+        self.assertNotIn("1.1.1.1", google_resolver)
+        self.assertEqual(rendered.count("hold obsolete 15m"), 3)
+
         dns_options = (
-            "resolvers whatsapp_dns resolve-prefer ipv4 "
+            "resolve-prefer ipv4 "
             "resolve-opts prevent-dup-ip init-addr last,none"
         )
-        self.assertIn(
-            f"server-template g_whatsapp_net_5222 16 g.whatsapp.net:5222 {dns_options}",
-            rendered,
+        resolver_groups = (
+            ("system", "whatsapp_dns_system"),
+            ("cloudflare", "whatsapp_dns_cloudflare"),
+            ("google", "whatsapp_dns_google"),
         )
-        self.assertIn(
-            f"server-template whatsapp_net_443 16 whatsapp.net:443 {dns_options}",
-            rendered,
-        )
+        for view, resolver in resolver_groups:
+            self.assertIn(
+                f"server-template g_whatsapp_net_5222_{view} 4 "
+                f"g.whatsapp.net:5222 resolvers {resolver} {dns_options}",
+                rendered,
+            )
+            self.assertIn(
+                f"server-template whatsapp_net_443_{view} 4 "
+                f"whatsapp.net:443 resolvers {resolver} {dns_options}",
+                rendered,
+            )
+        self.assertEqual(rendered.count("server-template"), 6)
 
     def test_critical_frontend_and_backend_semantics_are_unchanged(self) -> None:
         rendered = render_haproxy(self.config)
@@ -106,14 +117,20 @@ class HAProxyRenderTests(unittest.TestCase):
         rendered = render_haproxy(config)
 
         self.assertIn("resolvers whatsapp_dns", rendered)
-        self.assertIn(
-            "server-template g_whatsapp_net_5222 16 g.whatsapp.net:5222 "
-            "resolvers whatsapp_dns resolve-prefer ipv4 "
-            "resolve-opts prevent-dup-ip init-addr last,none",
-            rendered,
-        )
+        for view, resolver in (
+            ("system", "whatsapp_dns_system"),
+            ("cloudflare", "whatsapp_dns_cloudflare"),
+            ("google", "whatsapp_dns_google"),
+        ):
+            self.assertIn(
+                f"server-template g_whatsapp_net_5222_{view} 4 g.whatsapp.net:5222 "
+                f"resolvers {resolver} resolve-prefer ipv4 "
+                "resolve-opts prevent-dup-ip init-addr last,none",
+                rendered,
+            )
         self.assertIn("server whatsapp_net_443 192.0.2.21:443\n", rendered)
         self.assertNotIn("server-template whatsapp_net_443", rendered)
+        self.assertEqual(rendered.count("server-template"), 3)
 
 
 if __name__ == "__main__":

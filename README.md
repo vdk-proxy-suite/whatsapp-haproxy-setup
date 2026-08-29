@@ -10,6 +10,17 @@
 Схема совместима с рекомендацией официального проекта WhatsApp Proxy для
 неблагоприятных сетевых условий. VoIP официальным proxy не поддерживается.
 
+## Изменения версии 1.2.1
+
+- Для каждого hostname-upstream HAProxy использует три независимых DNS-view:
+  resolver VM, Cloudflare (`1.1.1.1`/`1.0.0.1`) и Google
+  (`8.8.8.8`/`8.8.4.4`). Это позволяет одновременно проверять разные
+  geo-DNS-ответы и выбирать доступный с VM адрес отдельно для chat и media
+- Cold-start readiness больше не принимает переходное состояние `UP 1/2`:
+  backend считается готовым только после успешного L4 health-check (`L4OK`)
+- Внешняя YAML-схема не изменилась; literal IPv4 по-прежнему остаётся одним
+  статическим upstream без DNS-ротации
+
 ## Изменения версии 1.2.0
 
 - DNS-upstream теперь представлен пулом из 16 независимо проверяемых IPv4:
@@ -40,7 +51,7 @@
 ## Быстрый запуск
 
 ```bash
-unzip whatsapp-haproxy-setup-standalone-1.2.0.zip
+unzip whatsapp-haproxy-setup-standalone-1.2.1.zip
 cd whatsapp-haproxy-setup
 cp config.example.yaml config.yaml
 nano config.yaml
@@ -70,18 +81,22 @@ sudo ./setuphaproxy.sh all --config /secure/path/whatsapp-proxy.yaml
 ## Runtime DNS-ротация upstream
 
 HAProxy переразрешает `probes.chat_upstream_host` и
-`probes.media_upstream_host` через DNS-серверы VM. Список nameserver
-считывается из `/etc/resolv.conf` при start/reload HAProxy; если сам
-список изменился, HAProxy нужно reload/restart. `/etc/hosts` в этом
-маршруте не используется.
+`probes.media_upstream_host` независимо через три DNS-view: DNS-серверы VM из
+`/etc/resolv.conf`, Cloudflare (`1.1.1.1`/`1.0.0.1`) и Google
+(`8.8.8.8`/`8.8.4.4`). Ответы разных resolver не смешиваются в гонке за первый
+ответ: у каждого view собственная группа server slots, а L4 health-check
+выбирает реально доступные с VM адреса. Если список DNS-серверов VM изменился,
+HAProxy нужно reload/restart. `/etc/hosts` в этом маршруте не используется.
 
 Для каждого DNS-upstream действует следующая семантика:
 
 - Базовый интервал переразрешения — 5 секунд, когда нет другого триггера;
   connection timeout health-check может запустить его раньше. Интервал задаёт
   `timeout resolve`, а не authoritative DNS TTL и не `hold valid`
-- HAProxy создаёт 16 слотов, запрещает дублирование адресов между ними и
-  накапливает как одновременные, так и последовательные одиночные A-records
+- HAProxy создаёт по четыре слота на каждый из трёх DNS-view, запрещает
+  дублирование адресов внутри одной группы и накапливает как одновременные,
+  так и последовательные одиночные A-records. Один IP может ожидаемо
+  повториться в разных DNS-view; это не влияет на проверку его доступности
 - Ранее замеченный адрес остаётся кандидатом 15 минут после последнего
   появления в корректном DNS-ответе. Повторное появление продлевает это окно
 - Каждый назначенный адрес проверяется TCP health-check с VM. Рабочие адреса
@@ -101,12 +116,15 @@ HAProxy переразрешает `probes.chat_upstream_host` и
   готовность снова определяют L4 health-checks
 - `init-addr last,none` не делает libc fallback. Если прежнего state нет,
   backend стартует без адреса и сам восстанавливается после успешного DNS-answer
+- VM-side readiness ждёт хотя бы один назначенный сервер со стабильным `UP` и
+  успешным `L4OK` в каждом backend; переходные `UP 1/2`/`INI` не считаются
+  готовностью. Только после этого проверяются локальные frontend `443`/`587`
 - DNS-пул хранится в памяти процесса. После холодного restart HAProxy или VM он
   собирается заново из последующих DNS-ответов; отдельного selector-daemon и
   постоянного кэша нет
 
 Если в upstream указан literal IPv4, HAProxy оставляет его статическим.
-Для перехода на 1.2.0 не нужно добавлять ключи в `config.yaml`: все текущие
+Для перехода на 1.2.1 не нужно добавлять ключи в `config.yaml`: все текущие
 поля и их значения сохраняют прежнюю семантику.
 
 ## Cloud firewall и DDoS
@@ -114,8 +132,9 @@ HAProxy переразрешает `probes.chat_upstream_host` и
 Setup не меняет cloud security group и не подключает DDoS-защиту. Для
 публичного сервиса разрешите ingress TCP только на `443` и `587`. SSH должен
 быть ограничен отдельно. VM нужен исходящий TCP к `g.whatsapp.net:5222` и
-`whatsapp.net:443`; если firewall не поддерживает DNS-правила, используйте
-подходящие общие egress-правила.
+`whatsapp.net:443`, а также DNS-доступ к resolver VM, `1.1.1.1`, `1.0.0.1`,
+`8.8.8.8` и `8.8.4.4` на UDP/TCP `53`. Если firewall не поддерживает
+DNS-правила, используйте подходящие общие egress-правила.
 
 UFW по умолчанию не меняется. `server.manage_ufw: true` добавляет два allow
 правила, но не заменяет cloud firewall.
