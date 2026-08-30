@@ -43,6 +43,234 @@ class HAProxyRenderTests(unittest.TestCase):
 
         self.assertEqual(render_haproxy(config), legacy)
 
+    def test_shared_443_is_opt_in_and_keeps_raw_587_fallback(self) -> None:
+        config = copy.deepcopy(self.config)
+        config["shared_443"] = {
+            "enabled": True,
+            "chat_loopback_port": 18443,
+            "probe_sni": "media-hel3-1.cdn.whatsapp.net",
+            "media_sni": {
+                "exact": ["whatsapp.net", "mmg.whatsapp.net"],
+                "suffixes": [".cdn.whatsapp.net"],
+            },
+        }
+
+        rendered = render_haproxy(config)
+        shared_frontend = section(rendered, "frontend whatsapp_shared_443")
+        chat_frontend = section(rendered, "frontend whatsapp_chat_tls")
+        loop_backend = section(rendered, "backend whatsapp_chat_tls_loop")
+        media_frontend = section(rendered, "frontend whatsapp_media")
+        chat_backend = section(rendered, "backend whatsapp_chat")
+        media_backend = section(rendered, "backend whatsapp_media")
+        capacity_table = section(rendered, "backend public_capacity_table")
+
+        self.assertIn("tune.bufsize 16384", rendered)
+        self.assertIn("    maxconn 96", rendered)
+        self.assertIn("    maxconnrate 45", rendered)
+        self.assertIn(
+            "stick-table type string len 16 size 1 expire 10m "
+            "store conn_cur,conn_rate(1s)",
+            capacity_table,
+        )
+        self.assertIn("bind 0.0.0.0:443", shared_frontend)
+        self.assertNotIn(" ssl ", shared_frontend)
+        self.assertIn("maxconn 48", shared_frontend)
+        self.assertIn("tcp-request connection track-sc0", shared_frontend)
+        self.assertIn(
+            "tcp-request connection track-sc1 str(public) "
+            "table public_capacity_table",
+            shared_frontend,
+        )
+        self.assertIn("sc1_conn_cur gt 64", shared_frontend)
+        self.assertIn("sc1_conn_rate gt 30", shared_frontend)
+        self.assertIn("tcp-request connection set-dst", shared_frontend)
+        self.assertIn(
+            "acl shared_443_media_exact req.ssl_sni,lower -m str "
+            "whatsapp.net mmg.whatsapp.net",
+            shared_frontend,
+        )
+        self.assertIn(
+            "acl shared_443_media_suffix req.ssl_sni,lower -m end .cdn.whatsapp.net",
+            shared_frontend,
+        )
+        self.assertIn("tcp-request content capture req.ssl_sni len 128", shared_frontend)
+        self.assertLess(
+            shared_frontend.index("tcp-request content capture req.ssl_sni"),
+            shared_frontend.index("tcp-request content accept if shared_443_hello"),
+        )
+        self.assertIn("tcp-request content reject if WAIT_END", shared_frontend)
+        self.assertNotIn("tcp-request content accept if WAIT_END", shared_frontend)
+        self.assertIn(
+            "use_backend whatsapp_media if shared_443_hello "
+            "shared_443_media_exact",
+            shared_frontend,
+        )
+        self.assertIn(
+            "use_backend whatsapp_media if shared_443_hello "
+            "shared_443_media_suffix",
+            shared_frontend,
+        )
+        self.assertIn("default_backend whatsapp_chat_tls_loop", shared_frontend)
+        self.assertIn("server chat_tls 127.0.0.1:18443 send-proxy", loop_backend)
+        self.assertNotIn("check", loop_backend)
+        self.assertIn(
+            "bind 127.0.0.1:18443 accept-proxy ssl crt "
+            "/etc/haproxy/ssl/proxy.whatsapp.net.pem",
+            chat_frontend,
+        )
+        self.assertNotIn("req.ssl_sni", chat_frontend)
+        self.assertNotIn("track-sc0", chat_frontend)
+        self.assertNotIn("set-dst", chat_frontend)
+        self.assertIn("default_backend whatsapp_chat", chat_frontend)
+        self.assertEqual(rendered.count("tcp-request connection track-sc0"), 2)
+        self.assertEqual(rendered.count("tcp-request connection track-sc1"), 2)
+        self.assertIn("bind 0.0.0.0:587", media_frontend)
+        self.assertIn("track-sc1 str(public)", media_frontend)
+        self.assertIn("observe layer4 send-proxy", chat_backend)
+        self.assertNotIn("send-proxy", media_backend)
+
+    def test_disabled_shared_443_keeps_legacy_render(self) -> None:
+        legacy = render_haproxy(self.config)
+        config = copy.deepcopy(self.config)
+        config["shared_443"] = {"enabled": False}
+
+        self.assertEqual(render_haproxy(config), legacy)
+
+    def test_shared_443_rejects_disallowed_cidrs_before_tracking(self) -> None:
+        config = copy.deepcopy(self.config)
+        config["access"]["allowed_cidrs"] = ["198.51.100.0/24"]
+        config["shared_443"] = {
+            "enabled": True,
+            "chat_loopback_port": 18443,
+            "probe_sni": "media-hel3-1.cdn.whatsapp.net",
+            "media_sni": {
+                "exact": ["whatsapp.net", "mmg.whatsapp.net"],
+                "suffixes": [".cdn.whatsapp.net"],
+            },
+        }
+
+        shared_frontend = section(
+            render_haproxy(config),
+            "frontend whatsapp_shared_443",
+        )
+        self.assertLess(
+            shared_frontend.index("reject if !allowed_client"),
+            shared_frontend.index("track-sc0"),
+        )
+        self.assertLess(
+            shared_frontend.index("track-sc0"),
+            shared_frontend.index("track-sc1"),
+        )
+        self.assertLess(
+            shared_frontend.index("track-sc1"),
+            shared_frontend.index("reject if { sc0_conn_cur"),
+        )
+
+    def test_shared_443_schema_is_strict_and_fail_safe(self) -> None:
+        valid_shared = {
+            "enabled": True,
+            "chat_loopback_port": 18443,
+            "probe_sni": "media-hel3-1.cdn.whatsapp.net",
+            "media_sni": {
+                "exact": ["whatsapp.net", "mmg.whatsapp.net"],
+                "suffixes": [".cdn.whatsapp.net"],
+            },
+        }
+        valid = copy.deepcopy(self.config)
+        valid["shared_443"] = valid_shared
+        validate(valid)
+
+        invalid_shared_values = (
+            None,
+            [],
+            {},
+            {"enabled": False, "chat_loopback_port": 18443},
+            {"enabled": True},
+            {
+                "enabled": True,
+                "chat_loopback_port": 443,
+                "probe_sni": valid_shared["probe_sni"],
+                "media_sni": valid_shared["media_sni"],
+            },
+            {
+                "enabled": True,
+                "chat_loopback_port": 18443,
+                "probe_sni": valid_shared["probe_sni"],
+                "media_sni": {"exact": [], "suffixes": []},
+            },
+            {
+                "enabled": True,
+                "chat_loopback_port": 18443,
+                "probe_sni": valid_shared["probe_sni"],
+                "media_sni": {
+                    "exact": ["whatsapp.net"],
+                    "suffixes": ["*.whatsapp.net"],
+                },
+            },
+            {
+                "enabled": True,
+                "chat_loopback_port": 18443,
+                "probe_sni": valid_shared["probe_sni"],
+                "media_sni": {
+                    "exact": ["whatsapp.net"],
+                    "suffixes": [".whatsapp.net"],
+                },
+            },
+            {
+                "enabled": True,
+                "chat_loopback_port": 18443,
+                "probe_sni": valid_shared["probe_sni"],
+                "media_sni": {
+                    "exact": ["mmg.whatsapp.net"],
+                    "suffixes": [".cdn.whatsapp.net"],
+                },
+            },
+            {
+                "enabled": True,
+                "chat_loopback_port": 18443,
+                "probe_sni": valid_shared["probe_sni"],
+                "media_sni": {
+                    "exact": ["whatsapp.net", "WHATSAPP.NET"],
+                    "suffixes": [".cdn.whatsapp.net"],
+                },
+            },
+            {**valid_shared, "probe_sni": "example.com"},
+            {**valid_shared, "unknown": True},
+        )
+        for shared in invalid_shared_values:
+            with self.subTest(shared=shared):
+                config = copy.deepcopy(self.config)
+                config["shared_443"] = shared
+                with self.assertRaises(ValueError):
+                    validate(config)
+
+        wrong_chat_port = copy.deepcopy(valid)
+        wrong_chat_port["ports"]["chat"] = 8443
+        with self.assertRaisesRegex(ValueError, "ports.chat to be exactly 443"):
+            validate(wrong_chat_port)
+
+        route_collision = copy.deepcopy(valid)
+        route_collision["routes"] = {
+            "media": {
+                "mode": "socks4",
+                "socks4": {"host": "127.0.0.1", "port": 18443},
+            },
+        }
+        with self.assertRaisesRegex(ValueError, "differ from local SOCKS4 route ports"):
+            validate(route_collision)
+
+        certificate_collision = copy.deepcopy(valid)
+        certificate_collision["certificate"]["dns_names"] = ["mmg.whatsapp.net"]
+        with self.assertRaisesRegex(ValueError, r"certificate\.dns_names\[0\]"):
+            validate(certificate_collision)
+
+        wildcard_certificate_collision = copy.deepcopy(valid)
+        wildcard_certificate_collision["certificate"]["dns_names"] = [
+            "*.cdn.whatsapp.net"
+        ]
+        with self.assertRaisesRegex(ValueError, r"certificate\.dns_names\[0\]"):
+            validate(wildcard_certificate_collision)
+
     def test_media_socks4_route_is_inherited_only_by_media_servers(self) -> None:
         config = copy.deepcopy(self.config)
         config["routes"] = {

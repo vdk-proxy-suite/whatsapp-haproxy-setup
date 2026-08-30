@@ -10,6 +10,21 @@ ports:
   chat: 443
   media: 587
 
+# Experimental single-port mode for clients configured with both chat and media
+# on 443. HAProxy inspects the raw TLS SNI: known media names use the media
+# backend, while every other connection reaches the local chat TLS terminator.
+# The regular raw media listener above remains active as a fallback.
+# shared_443:
+#   enabled: true
+#   chat_loopback_port: 18443
+#   probe_sni: "media-hel3-1.cdn.whatsapp.net"
+#   media_sni:
+#     exact:
+#       - "whatsapp.net"
+#       - "mmg.whatsapp.net"
+#     suffixes:
+#       - ".cdn.whatsapp.net"
+
 # Optional per-backend egress. Missing routes/backends are direct. Uncomment
 # only after the local-only passwordless SOCKS4 bridge is listening.
 # routes:

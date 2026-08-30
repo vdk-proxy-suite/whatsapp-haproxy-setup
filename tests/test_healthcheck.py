@@ -710,6 +710,103 @@ class MainVMProbeTests(unittest.TestCase):
         stats.assert_called_once_with("/run/haproxy/admin.sock", 30.0, current_config)
         runtime.assert_called_once_with(current_config, "/run/haproxy/admin.sock", 30.0)
 
+    def test_vm_scope_adds_required_shared_443_media_probe_when_enabled(self) -> None:
+        current_config = vm_config()
+        current_config["shared_443"] = {
+            "enabled": True,
+            "chat_loopback_port": 18443,
+            "probe_sni": "media-hel3-1.cdn.whatsapp.net",
+            "media_sni": {
+                "exact": ["whatsapp.net", "mmg.whatsapp.net"],
+                "suffixes": [".cdn.whatsapp.net"],
+            },
+        }
+        output = io.StringIO()
+        with (
+            patch.object(sys, "argv", ["healthcheck.py", "--scope", "vm", "--config", "config.yaml"]),
+            patch.object(healthcheck, "load_config", return_value=current_config),
+            patch.object(healthcheck, "validate"),
+            patch.object(healthcheck, "command", return_value={"returncode": 0}),
+            patch.object(
+                healthcheck,
+                "tls_connect",
+                return_value={"tls_version": "TLSv1.3"},
+            ) as tls,
+            patch.object(healthcheck, "admin_stats", return_value={"ok": True}),
+            patch.object(healthcheck, "runtime_dns_state", return_value={"ok": True}),
+            redirect_stdout(output),
+        ):
+            return_code = healthcheck.main()
+
+        self.assertEqual(return_code, 0)
+        checks = json.loads(output.getvalue())["checks"]
+        self.assertEqual(checks[-1]["name"], "local_media_shared_443")
+        self.assertTrue(checks[-1]["required"])
+        self.assertEqual(tls.call_count, 3)
+        tls.assert_any_call(
+            "127.0.0.1",
+            443,
+            "media-hel3-1.cdn.whatsapp.net",
+            2.0,
+            True,
+        )
+
+    def test_e2e_scope_adds_required_shared_443_media_probe_when_enabled(self) -> None:
+        current_config = vm_config()
+        current_config["shared_443"] = {
+            "enabled": True,
+            "chat_loopback_port": 18443,
+            "probe_sni": "media-hel3-1.cdn.whatsapp.net",
+            "media_sni": {
+                "exact": ["whatsapp.net", "mmg.whatsapp.net"],
+                "suffixes": [".cdn.whatsapp.net"],
+            },
+        }
+        output = io.StringIO()
+        with (
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "healthcheck.py",
+                    "--scope",
+                    "e2e",
+                    "--config",
+                    "config.yaml",
+                    "--host",
+                    "proxy.example",
+                ],
+            ),
+            patch.object(healthcheck, "load_config", return_value=current_config),
+            patch.object(healthcheck, "validate"),
+            patch.object(
+                healthcheck,
+                "tls_connect",
+                return_value={"tls_version": "TLSv1.3"},
+            ) as tls,
+            redirect_stdout(output),
+        ):
+            return_code = healthcheck.main()
+
+        self.assertEqual(return_code, 0)
+        checks = json.loads(output.getvalue())["checks"]
+        self.assertEqual(checks[-1]["name"], "proxy_media_shared_443")
+        self.assertTrue(checks[-1]["required"])
+        tls.assert_any_call(
+            "proxy.example",
+            443,
+            "192.0.2.100",
+            2.0,
+            False,
+        )
+        tls.assert_any_call(
+            "proxy.example",
+            443,
+            "media-hel3-1.cdn.whatsapp.net",
+            2.0,
+            True,
+        )
+
 
 class MainRoutesProbeTests(unittest.TestCase):
     def test_routes_scope_checks_both_backend_route_contracts(self) -> None:

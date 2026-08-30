@@ -1,7 +1,7 @@
 # Standalone HAProxy proxy for WhatsApp
 
 Нативный setup для Ubuntu 24.04 без Docker. Он устанавливает HAProxy из
-репозитория Ubuntu и поднимает только два публичных TCP-порта:
+репозитория Ubuntu и по умолчанию поднимает два публичных TCP-порта:
 
 - `443`: TLS termination и передача chat-трафика в `g.whatsapp.net:5222` с
   корректным PROXY header
@@ -9,6 +9,20 @@
 
 Схема совместима с рекомендацией официального проекта WhatsApp Proxy для
 неблагоприятных сетевых условий. VoIP официальным proxy не поддерживается.
+
+## Изменения версии 1.4.0
+
+- Добавлен opt-in режим `shared_443`: chat и media клиента могут использовать
+  один публичный порт `443`, при этом адрес proxy не меняется
+- Публичный `443` становится raw TCP SNI-mux. Известный media SNI передаётся в
+  прежний raw media backend без PROXY header, а остальные соединения идут в
+  local-only TLS terminator chat и далее с обязательным PROXY v1
+- Публичный raw media listener `587` остаётся рабочим fallback; оба media-входа
+  используют один backend и один выбранный `direct`/SOCKS4 маршрут
+- VM/e2e healthcheck при включённом режиме дополнительно выполняет проверенный
+  TLS handshake до WhatsApp media через общий `443`
+- Без блока `shared_443` или при `enabled: false` генерируется byte-for-byte
+  прежняя конфигурация версии 1.3.0
 
 ## Изменения версии 1.3.0
 
@@ -63,7 +77,7 @@
 ## Быстрый запуск
 
 ```bash
-unzip whatsapp-haproxy-setup-standalone-1.3.0.zip
+unzip whatsapp-haproxy-setup-standalone-1.4.0.zip
 cd whatsapp-haproxy-setup
 cp config.example.yaml config.yaml
 nano config.yaml
@@ -131,6 +145,69 @@ SOCKS4 preflight получает IPv4-кандидаты через систе�
 CONNECT к ним; media считается рабочим только после проверенного TLS handshake
 через созданный tunnel. Полные три DNS-view и все runtime slots затем проверяет
 VM-side healthcheck запущенного HAProxy.
+
+## Общий порт 443 для chat и media
+
+Некоторые сети доставляют ClientHello до VM на `443`, но блокируют или
+фильтруют payload на нестандартном media-порту. Для такого случая можно
+включить экспериментальный SNI-mux:
+
+```yaml
+shared_443:
+  enabled: true
+  chat_loopback_port: 18443
+  probe_sni: "media-hel3-1.cdn.whatsapp.net"
+  media_sni:
+    exact:
+      - "whatsapp.net"
+      - "mmg.whatsapp.net"
+    suffixes:
+      - ".cdn.whatsapp.net"
+```
+
+При включённом режиме public listener `443` не завершает TLS сразу, а ждёт
+ClientHello до 5 секунд. SNI из `media_sni` направляется без расшифровки в
+`whatsapp_media`; полный TLS ClientHello с неизвестным SNI или без SNI
+fail-safe направляется в local-only `127.0.0.1:18443`, где HAProxy завершает
+chat TLS и передаёт трафик в `whatsapp_chat`. Неполный и не-TLS payload
+отклоняется после inspect-delay.
+
+`chat_loopback_port` должен быть свободным локальным портом, отличаться от
+публичных портов и портов настроенных SOCKS4 routes. Его не нужно открывать в
+UFW или cloud firewall. В правилах SNI разрешены только точные ASCII DNS-имена
+и узкие suffixes; широкая маска `.whatsapp.net` запрещена, потому что она
+перехватила бы chat host `g.whatsapp.net`. Exact-список обязан содержать
+`probes.media_upstream_host`.
+
+`probe_sni` — обязательный CDN-like SNI для VM/e2e canary; он должен
+совпадать с одним из exact/suffix правил. Значение выше соответствует реально
+наблюдаемому Android media ClientHello. Если клиент начинает использовать
+другой CDN namespace, сначала обновите media rules и этот canary.
+
+Media TLS остаётся сквозным и проверяется телефоном против сертификата
+WhatsApp; HAProxy видит только незашифрованный SNI стандартного TLS
+ClientHello. `587` продолжает работать независимо. `routes.media`, DNS-пулы и
+health-check backend одинаковы для media на `443` и `587`.
+
+Один chat-клиент на общем `443` занимает внешний raw stream и внутренний TLS
+stream HAProxy. Генератор резервирует для loopback дополнительные process
+slots и добавляет к process accept-rate резерв в пределах
+`limits.tls_rate_per_second`, но отдельная aggregate stick-table по-прежнему
+ограничивает сумму внешних `443`/`587` значениями
+`limits.global_connections` и
+`limits.global_connection_rate_per_second`. Поэтому внутренний re-entry не
+может быть вытеснен внешними media-соединениями и одновременно не расширяет
+заданный публичный лимит. ACL и per-IP rate limit применяются только на
+публичном frontend, а не повторно на loopback. Неполный или не-TLS payload на
+`443` отклоняется после inspect-delay и не занимает внутренний TLS slot.
+Резерв предотвращает steady-state starvation, но не гарантирует fairness
+между listeners во время непрерывного внешнего flood: для публичного proxy
+cloud DDoS protection остаётся обязательной.
+
+Режим остаётся opt-in: набор media SNI контролируется конфигурацией, поскольку
+закрытый клиент WhatsApp может менять используемые CDN-имена. Успешный
+synthetic TLS healthcheck доказывает маршрут и сертификат, но окончательная
+проверка — отправка и загрузка media в приложении.
 
 ## Runtime DNS-ротация upstream
 
@@ -219,8 +296,10 @@ venv/bin/python tools/healthcheck.py --scope e2e --config config.yaml \
 
 Windows PowerShell использует `venv\Scripts\python.exe`. E2E выполняет TLS
 handshake с самоподписанным frontend `443` и проверенный сквозной TLS handshake
-до `*.whatsapp.net` через `587`. Он не эмулирует закрытый протокол WhatsApp и не
-доказывает доставку сообщения в приложении.
+до `*.whatsapp.net` через `587`. При `shared_443.enabled: true` та же
+проверенная media TLS-проверка дополнительно проходит через общий `443`. Он не
+эмулирует закрытый протокол WhatsApp и не доказывает доставку сообщения в
+приложении.
 
 Неблокирующая smoke-проверка per-IP лимита:
 
@@ -230,9 +309,11 @@ python tools/healthcheck.py --scope limits --config config.yaml
 
 ## Настройка WhatsApp
 
-В приложении укажите публичный IP или DNS-имя VM, порт чата `443` и порт медиа
-`587`. Сертификат на `443` создаётся локально при установке и не требует
-публичного CA.
+В обычном режиме укажите публичный IP или DNS-имя VM, порт чата `443` и порт
+медиа `587`. При включённом `shared_443` можно указать `443` для обоих портов;
+`587` остаётся fallback. Сертификат chat на `443` создаётся локально при
+установке и не требует публичного CA. Media TLS на общем `443` HAProxy не
+завершает.
 
 ## Полная очистка
 
@@ -264,3 +345,4 @@ HAProxy, но намеренно не запускает глобальный `a
 - HAProxy `server-template`: <https://docs.haproxy.org/2.8/configuration.html#server-template>
 - HAProxy `socks4`: <https://docs.haproxy.org/2.8/configuration.html#5.2-socks4>
 - HAProxy `check-via-socks4`: <https://docs.haproxy.org/2.8/configuration.html#5.2-check-via-socks4>
+- HAProxy `req.ssl_sni`: <https://docs.haproxy.org/2.8/configuration.html#7.3.5-req.ssl_sni>

@@ -16,7 +16,14 @@ from pathlib import Path
 from typing import Any, Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from config import get_backend_route, get_path, load_config, validate  # noqa: E402
+from config import (  # noqa: E402
+    get_backend_route,
+    get_path,
+    get_shared_443,
+    load_config,
+    shared_443_enabled,
+    validate,
+)
 
 
 DNS_RESOLVER_VIEWS = ("system", "cloudflare", "google")
@@ -599,6 +606,7 @@ def main() -> int:
     timeout = float(g("probes.timeout_seconds"))
     readiness_timeout = max(30.0, timeout * 4)
     target = args.host or str(g("server.public_ip"))
+    chat_sni = str(g("server.public_ip"))
     report = Report(args.scope)
 
     if args.scope == "vm":
@@ -613,11 +621,35 @@ def main() -> int:
             "backend_runtime_dns",
             lambda: runtime_dns_state(config, str(g("probes.admin_socket")), readiness_timeout),
         )
-        report.check("local_chat_tls", lambda: tls_connect("127.0.0.1", int(g("ports.chat")), target, timeout, False))
+        report.check("local_chat_tls", lambda: tls_connect("127.0.0.1", int(g("ports.chat")), chat_sni, timeout, False))
         report.check("local_media_tls", lambda: tls_connect("127.0.0.1", int(g("ports.media")), str(g("probes.media_upstream_host")), timeout, True))
+        if shared_443_enabled(config):
+            shared_media_sni = str(get_shared_443(config)["probe_sni"])
+            report.check(
+                "local_media_shared_443",
+                lambda: tls_connect(
+                    "127.0.0.1",
+                    int(g("ports.chat")),
+                    shared_media_sni,
+                    timeout,
+                    True,
+                ),
+            )
     elif args.scope == "e2e":
-        report.check("proxy_chat_tls", lambda: tls_connect(target, int(g("ports.chat")), target, timeout, False))
+        report.check("proxy_chat_tls", lambda: tls_connect(target, int(g("ports.chat")), chat_sni, timeout, False))
         report.check("proxy_media_tls", lambda: tls_connect(target, int(g("ports.media")), str(g("probes.media_upstream_host")), timeout, True))
+        if shared_443_enabled(config):
+            shared_media_sni = str(get_shared_443(config)["probe_sni"])
+            report.check(
+                "proxy_media_shared_443",
+                lambda: tls_connect(
+                    target,
+                    int(g("ports.chat")),
+                    shared_media_sni,
+                    timeout,
+                    True,
+                ),
+            )
     elif args.scope == "limits":
         report.check("per_ip_connection_limit", lambda: limit_smoke(target, int(g("ports.chat")), int(g("limits.per_ip_connections")), timeout), required=False)
     else:

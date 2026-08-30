@@ -12,6 +12,10 @@ import yaml
 
 TIMEOUT_RE = re.compile(r"^[1-9][0-9]*(ms|s|m|h)$")
 SIZE_RE = re.compile(r"^[1-9][0-9]*[kKmMgG]?$" )
+DNS_NAME_RE = re.compile(
+    r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+)
 EXAMPLE_IP = "203.0.113.10"
 DNS_SERVER_SLOTS_PER_RESOLVER = 4
 DNS_RESOLVERS = (
@@ -21,6 +25,7 @@ DNS_RESOLVERS = (
 )
 ROUTE_BACKENDS = ("chat", "media")
 SOCKS4_LOOPBACK_HOST = "127.0.0.1"
+SHARED_443_LOOPBACK_HOST = "127.0.0.1"
 
 
 def load_config(path: str) -> dict[str, Any]:
@@ -63,6 +68,180 @@ def get_backend_route(config: dict[str, Any], backend: str) -> dict[str, Any]:
     if not isinstance(route, dict):
         raise ValueError(f"routes.{backend} must be a mapping")
     return route
+
+
+def get_shared_443(config: dict[str, Any]) -> dict[str, Any]:
+    if "shared_443" not in config:
+        return {"enabled": False}
+    shared = config["shared_443"]
+    if not isinstance(shared, dict):
+        raise ValueError("shared_443 must be a mapping")
+    return shared
+
+
+def shared_443_enabled(config: dict[str, Any]) -> bool:
+    return get_shared_443(config).get("enabled") is True
+
+
+def _validated_sni_name(value: Any, path: str, *, suffix: bool) -> str:
+    if not isinstance(value, str) or not value or not value.isascii():
+        raise ValueError(f"{path} must be a non-empty ASCII DNS name")
+    normalized = value.lower()
+    if suffix:
+        if not normalized.startswith("."):
+            raise ValueError(f"{path} must start with a dot")
+        candidate = normalized[1:]
+    else:
+        if normalized.startswith("."):
+            raise ValueError(f"{path} must not start with a dot")
+        candidate = normalized
+    if not DNS_NAME_RE.fullmatch(candidate):
+        raise ValueError(f"{path} must be a valid DNS name without wildcards")
+    return normalized
+
+
+def validate_shared_443(config: dict[str, Any]) -> None:
+    if "shared_443" not in config:
+        return
+    shared = get_shared_443(config)
+    unknown = [
+        str(key)
+        for key in shared
+        if key not in {"enabled", "chat_loopback_port", "probe_sni", "media_sni"}
+    ]
+    if unknown:
+        raise ValueError("shared_443 contains unsupported keys: " + ", ".join(unknown))
+    if "enabled" not in shared or not isinstance(shared["enabled"], bool):
+        raise ValueError("shared_443.enabled must be true or false")
+    if not shared["enabled"]:
+        if len(shared) != 1:
+            raise ValueError(
+                "disabled shared_443 must not contain chat_loopback_port, "
+                "probe_sni or media_sni"
+            )
+        return
+
+    if need_int(config, "ports.chat", 1, 65535) != 443:
+        raise ValueError("shared_443 requires ports.chat to be exactly 443")
+    if "chat_loopback_port" not in shared:
+        raise ValueError("shared_443.chat_loopback_port is required when enabled")
+    loopback_port = shared["chat_loopback_port"]
+    if (
+        isinstance(loopback_port, bool)
+        or not isinstance(loopback_port, int)
+        or not 1 <= loopback_port <= 65535
+    ):
+        raise ValueError(
+            "shared_443.chat_loopback_port must be an integer from 1 to 65535"
+        )
+    if loopback_port in {
+        need_int(config, "ports.chat", 1, 65535),
+        need_int(config, "ports.media", 1, 65535),
+    }:
+        raise ValueError("shared_443.chat_loopback_port must differ from public ports")
+    route_ports = {
+        int(route["socks4"]["port"])
+        for backend in ROUTE_BACKENDS
+        for route in (get_backend_route(config, backend),)
+        if route["mode"] == "socks4"
+    }
+    if loopback_port in route_ports:
+        raise ValueError(
+            "shared_443.chat_loopback_port must differ from local SOCKS4 route ports"
+        )
+
+    if "probe_sni" not in shared:
+        raise ValueError("shared_443.probe_sni is required when enabled")
+    probe_sni = _validated_sni_name(
+        shared["probe_sni"],
+        "shared_443.probe_sni",
+        suffix=False,
+    )
+
+    sni = shared.get("media_sni")
+    if not isinstance(sni, dict):
+        raise ValueError("shared_443.media_sni must be a mapping")
+    unknown_sni = [str(key) for key in sni if key not in {"exact", "suffixes"}]
+    if unknown_sni:
+        raise ValueError(
+            "shared_443.media_sni contains unsupported keys: "
+            + ", ".join(unknown_sni)
+        )
+    exact = sni.get("exact")
+    suffixes = sni.get("suffixes")
+    if not isinstance(exact, list) or not exact:
+        raise ValueError("shared_443.media_sni.exact must be a non-empty list")
+    if not isinstance(suffixes, list):
+        raise ValueError("shared_443.media_sni.suffixes must be a list")
+    normalized_exact = [
+        _validated_sni_name(
+            value,
+            f"shared_443.media_sni.exact[{index}]",
+            suffix=False,
+        )
+        for index, value in enumerate(exact)
+    ]
+    normalized_suffixes = [
+        _validated_sni_name(
+            value,
+            f"shared_443.media_sni.suffixes[{index}]",
+            suffix=True,
+        )
+        for index, value in enumerate(suffixes)
+    ]
+    if len(set(normalized_exact)) != len(normalized_exact):
+        raise ValueError("shared_443.media_sni.exact must not contain duplicates")
+    if len(set(normalized_suffixes)) != len(normalized_suffixes):
+        raise ValueError("shared_443.media_sni.suffixes must not contain duplicates")
+    if probe_sni not in normalized_exact and not any(
+        probe_sni.endswith(suffix) for suffix in normalized_suffixes
+    ):
+        raise ValueError("shared_443.probe_sni must match a configured media SNI rule")
+
+    media_host = str(get_path(config, "probes.media_upstream_host")).rstrip(".").lower()
+    try:
+        ipaddress.ip_address(media_host)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("shared_443 requires a DNS media upstream host")
+    if media_host not in normalized_exact:
+        raise ValueError(
+            "shared_443.media_sni.exact must include probes.media_upstream_host"
+        )
+
+    chat_host = str(get_path(config, "probes.chat_upstream_host")).rstrip(".").lower()
+    try:
+        ipaddress.ip_address(chat_host)
+    except ValueError:
+        if chat_host in normalized_exact or any(
+            chat_host.endswith(suffix) for suffix in normalized_suffixes
+        ):
+            raise ValueError("shared_443 media SNI rules must not match the chat upstream host")
+
+    for index, value in enumerate(get_path(config, "certificate.dns_names")):
+        certificate_name = str(value).rstrip(".").lower()
+        if certificate_name.startswith("*.") and certificate_name.count("*") == 1:
+            certificate_suffix = certificate_name[1:]
+            overlaps = any(
+                item.endswith(certificate_suffix) for item in normalized_exact
+            ) or any(
+                suffix.endswith(certificate_suffix)
+                or certificate_suffix.endswith(suffix)
+                for suffix in normalized_suffixes
+            )
+        elif "*" in certificate_name:
+            overlaps = True
+        else:
+            overlaps = certificate_name in normalized_exact or any(
+                certificate_name.endswith(suffix)
+                for suffix in normalized_suffixes
+            )
+        if overlaps:
+            raise ValueError(
+                "shared_443 media SNI rules must not match "
+                f"certificate.dns_names[{index}]"
+            )
 
 
 def validate_routes(config: dict[str, Any]) -> None:
@@ -197,6 +376,7 @@ def validate(config: dict[str, Any], reject_example: bool = False) -> None:
         if not str(get_path(config, path)).strip():
             raise ValueError(f"{path} cannot be empty")
     validate_routes(config)
+    validate_shared_443(config)
 
 
 def uses_runtime_dns(host: Any) -> bool:
@@ -238,6 +418,9 @@ def render_haproxy(config: dict[str, Any]) -> str:
     media_host = g("probes.media_upstream_host")
     chat_route_options = render_route_server_options(config, "chat")
     media_route_options = render_route_server_options(config, "media")
+    shared = get_shared_443(config)
+    shared_enabled = shared.get("enabled") is True
+    tune_bufsize = 16384 if shared_enabled else 4096
     uses_dns = uses_runtime_dns(chat_host) or uses_runtime_dns(media_host)
     resolver_lines: list[str] = []
     if uses_dns:
@@ -282,26 +465,152 @@ def render_haproxy(config: dict[str, Any]) -> str:
             "",
         ]
     cidrs = g("access.allowed_cidrs")
+    access_acl_lines: list[str] = []
+    access_reject_lines: list[str] = []
     access_lines: list[str] = []
     if cidrs:
-        access_lines = [
+        access_acl_lines = [
             f"    acl allowed_client src {' '.join(str(item) for item in cidrs)}",
+        ]
+        access_reject_lines = [
             "    tcp-request connection reject if !allowed_client",
         ]
+        access_lines = access_acl_lines + access_reject_lines
 
     common_frontend = access_lines + [
         "    tcp-request connection track-sc0 src table abuse_table",
         f"    tcp-request connection reject if {{ sc0_conn_cur gt {g('limits.per_ip_connections')} }}",
         f"    tcp-request connection reject if {{ sc0_conn_rate gt {g('limits.per_ip_connection_rate')} }}",
     ]
+    process_maxconn = int(g("limits.global_connections"))
+    process_maxconnrate = int(g("limits.global_connection_rate_per_second"))
+    public_capacity_sections: list[str] = []
+    public_frontend_rules = common_frontend
+    if shared_enabled:
+        process_maxconn += min(
+            int(g("limits.global_connections")),
+            int(g("limits.chat_connections")),
+        )
+        process_maxconnrate += min(
+            int(g("limits.global_connection_rate_per_second")),
+            int(g("limits.tls_rate_per_second")),
+        )
+        public_capacity_sections = [
+            "backend public_capacity_table",
+            (
+                "    stick-table type string len 16 size 1 "
+                f"expire {g('limits.stick_table_expire')} "
+                "store conn_cur,conn_rate(1s)"
+            ),
+            "",
+        ]
+        public_frontend_rules = access_lines + [
+            "    tcp-request connection track-sc0 src table abuse_table",
+            (
+                "    tcp-request connection track-sc1 str(public) "
+                "table public_capacity_table"
+            ),
+            (
+                "    tcp-request connection reject if "
+                f"{{ sc0_conn_cur gt {g('limits.per_ip_connections')} }}"
+            ),
+            (
+                "    tcp-request connection reject if "
+                f"{{ sc0_conn_rate gt {g('limits.per_ip_connection_rate')} }}"
+            ),
+            (
+                "    tcp-request connection reject if "
+                f"{{ sc1_conn_cur gt {g('limits.global_connections')} }}"
+            ),
+            (
+                "    tcp-request connection reject if "
+                "{ sc1_conn_rate gt "
+                f"{g('limits.global_connection_rate_per_second')} }}"
+            ),
+        ]
+        media_sni = shared["media_sni"]
+        exact = [str(item).lower() for item in media_sni["exact"]]
+        suffixes = [str(item).lower() for item in media_sni["suffixes"]]
+        loopback_port = int(shared["chat_loopback_port"])
+        shared_443_sections = [
+            "frontend whatsapp_shared_443",
+            f"    bind {g('server.listen_ip')}:{g('ports.chat')}",
+            (
+                "    maxconn "
+                f"{max(int(g('limits.chat_connections')), int(g('limits.media_connections')))}"
+            ),
+            f"    backlog {g('limits.backlog')}",
+            *public_frontend_rules,
+            f"    tcp-request connection set-dst ipv4({g('server.public_ip')})",
+            "    tcp-request inspect-delay 5s",
+            "    acl shared_443_hello req.ssl_hello_type 1",
+            f"    acl shared_443_media_exact req.ssl_sni,lower -m str {' '.join(exact)}",
+            *(
+                [
+                    "    acl shared_443_media_suffix req.ssl_sni,lower -m end "
+                    + " ".join(suffixes)
+                ]
+                if suffixes
+                else []
+            ),
+            (
+                "    tcp-request content capture req.ssl_sni len 128 "
+                "if shared_443_hello"
+            ),
+            "    tcp-request content accept if shared_443_hello",
+            "    tcp-request content reject if WAIT_END",
+            (
+                "    use_backend whatsapp_media if shared_443_hello "
+                "shared_443_media_exact"
+            ),
+            *(
+                [
+                    "    use_backend whatsapp_media if shared_443_hello "
+                    "shared_443_media_suffix"
+                ]
+                if suffixes
+                else []
+            ),
+            "    default_backend whatsapp_chat_tls_loop",
+            "",
+            "backend whatsapp_chat_tls_loop",
+            (
+                f"    server chat_tls {SHARED_443_LOOPBACK_HOST}:"
+                f"{loopback_port} send-proxy"
+            ),
+            "",
+            "frontend whatsapp_chat_tls",
+            (
+                f"    bind {SHARED_443_LOOPBACK_HOST}:{loopback_port} "
+                "accept-proxy ssl crt /etc/haproxy/ssl/proxy.whatsapp.net.pem"
+            ),
+            f"    maxconn {g('limits.chat_connections')}",
+            f"    backlog {g('limits.backlog')}",
+            "    default_backend whatsapp_chat",
+            "",
+        ]
+    else:
+        shared_443_sections = [
+            "frontend whatsapp_chat_tls",
+            (
+                f"    bind {g('server.listen_ip')}:{g('ports.chat')} "
+                "ssl crt /etc/haproxy/ssl/proxy.whatsapp.net.pem"
+            ),
+            f"    maxconn {g('limits.chat_connections')}",
+            f"    backlog {g('limits.backlog')}",
+            *common_frontend,
+            f"    tcp-request connection set-dst ipv4({g('server.public_ip')})",
+            "    default_backend whatsapp_chat",
+            "",
+        ]
     lines = [
         "global",
         "    log stdout format raw local0",
-        f"    maxconn {g('limits.global_connections')}",
-        f"    maxconnrate {g('limits.global_connection_rate_per_second')}",
+        f"    maxconn {process_maxconn}",
+        f"    maxconnrate {process_maxconnrate}",
         f"    maxsslconn {g('limits.tls_connections')}",
         f"    maxsslrate {g('limits.tls_rate_per_second')}",
-        "    tune.bufsize 4096",
+        f"    tune.bufsize {tune_bufsize}",
         "    spread-checks 5",
         "    ssl-server-verify none",
         f"    stats socket {g('probes.admin_socket')} mode 660 level operator user haproxy group haproxy",
@@ -330,14 +639,8 @@ def render_haproxy(config: dict[str, Any]) -> str:
         "backend abuse_table",
         f"    stick-table type ip size {g('limits.stick_table_size')} expire {g('limits.stick_table_expire')} store conn_cur,conn_rate({g('limits.per_ip_rate_period_seconds')}s)",
         "",
-        "frontend whatsapp_chat_tls",
-        f"    bind {g('server.listen_ip')}:{g('ports.chat')} ssl crt /etc/haproxy/ssl/proxy.whatsapp.net.pem",
-        f"    maxconn {g('limits.chat_connections')}",
-        f"    backlog {g('limits.backlog')}",
-        *common_frontend,
-        f"    tcp-request connection set-dst ipv4({g('server.public_ip')})",
-        "    default_backend whatsapp_chat",
-        "",
+        *public_capacity_sections,
+        *shared_443_sections,
         "backend whatsapp_chat",
         "    balance leastconn",
         (
@@ -351,7 +654,7 @@ def render_haproxy(config: dict[str, Any]) -> str:
         f"    bind {g('server.listen_ip')}:{g('ports.media')}",
         f"    maxconn {g('limits.media_connections')}",
         f"    backlog {g('limits.backlog')}",
-        *common_frontend,
+        *public_frontend_rules,
         "    default_backend whatsapp_media",
         "",
         "backend whatsapp_media",
