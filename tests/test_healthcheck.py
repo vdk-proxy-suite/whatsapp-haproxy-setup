@@ -4,9 +4,11 @@ from contextlib import redirect_stdout
 import io
 import json
 from pathlib import Path
+import socket
+import ssl
 import sys
 import unittest
-from unittest.mock import call, patch
+from unittest.mock import MagicMock, call, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -33,6 +35,8 @@ def vm_config() -> dict:
     result["probes"].update({
         "timeout_seconds": 2,
         "admin_socket": "/run/haproxy/admin.sock",
+        "chat_upstream_port": 5222,
+        "media_upstream_port": 443,
     })
     return result
 
@@ -160,6 +164,122 @@ class ResolverParsingTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "counters are incomplete"):
             healthcheck.parse_resolver_stats(text)
+
+
+class RoutePreflightTests(unittest.TestCase):
+    @staticmethod
+    def socks_config(backend: str = "media") -> dict:
+        result = vm_config()
+        result["routes"] = {
+            backend: {
+                "mode": "socks4",
+                "socks4": {"host": "127.0.0.1", "port": 11081},
+            },
+        }
+        return result
+
+    def test_direct_route_requires_no_dns_or_connection_preflight(self) -> None:
+        with (
+            patch.object(healthcheck, "resolve_ipv4_addresses") as resolve,
+            patch.object(healthcheck, "open_socks4_tunnel") as connect,
+        ):
+            result = healthcheck.preflight_route(vm_config(), "media", 2.0)
+
+        self.assertEqual(result, {"mode": "direct", "preflight": "not_required"})
+        resolve.assert_not_called()
+        connect.assert_not_called()
+
+    def test_socks4_request_matches_haproxy_wire_format(self) -> None:
+        client = MagicMock()
+        client.recv.return_value = b"\x00\x5a\x00\x00\x00\x00\x00\x00"
+        with patch.object(healthcheck.socket, "create_connection", return_value=client) as create:
+            returned, details = healthcheck.open_socks4_tunnel(
+                "127.0.0.1",
+                11081,
+                "198.51.100.20",
+                443,
+                2.0,
+            )
+
+        self.assertIs(returned, client)
+        create.assert_called_once_with(("127.0.0.1", 11081), timeout=2.0)
+        client.settimeout.assert_called_once_with(2.0)
+        client.sendall.assert_called_once_with(
+            b"\x04\x01\x01\xbb" + socket.inet_aton("198.51.100.20") + b"HAProxy\x00"
+        )
+        self.assertEqual(details["target"], ["198.51.100.20", 443])
+        client.close.assert_not_called()
+        client.close()
+
+    def test_rejected_socks4_handshake_closes_tunnel(self) -> None:
+        client = MagicMock()
+        client.recv.return_value = b"\x00\x5b\x00\x00\x00\x00\x00\x00"
+        with (
+            patch.object(healthcheck.socket, "create_connection", return_value=client),
+            self.assertRaisesRegex(RuntimeError, "rejected with code 0x5b"),
+        ):
+            healthcheck.open_socks4_tunnel("127.0.0.1", 11081, "198.51.100.20", 443, 2.0)
+
+        client.close.assert_called_once_with()
+
+    def test_chat_route_stops_after_successful_connect(self) -> None:
+        config = self.socks_config("chat")
+        tunnel = MagicMock()
+        details = {"mode": "socks4", "reply": "granted"}
+        with (
+            patch.object(healthcheck, "resolve_ipv4_addresses", return_value=["198.51.100.10"]),
+            patch.object(healthcheck, "open_socks4_tunnel", return_value=(tunnel, details)) as connect,
+            patch.object(healthcheck.ssl, "create_default_context") as tls_context,
+        ):
+            result = healthcheck.preflight_route(config, "chat", 2.0)
+
+        self.assertEqual(result, details)
+        connect.assert_called_once_with("127.0.0.1", 11081, "198.51.100.10", 5222, 2.0)
+        tls_context.assert_not_called()
+        tunnel.close.assert_called_once_with()
+
+    def test_media_route_requires_verified_tls_with_upstream_sni(self) -> None:
+        config = self.socks_config("media")
+        tunnel = MagicMock()
+        details = {"mode": "socks4", "reply": "granted"}
+        context = MagicMock()
+        tls_wrapper = MagicMock()
+        tls = tls_wrapper.__enter__.return_value
+        tls.getpeercert.return_value = b"certificate"
+        tls.version.return_value = "TLSv1.3"
+        tls.cipher.return_value = ("TLS_AES_256_GCM_SHA384", "TLSv1.3", 256)
+        context.wrap_socket.return_value = tls_wrapper
+        with (
+            patch.object(healthcheck, "resolve_ipv4_addresses", return_value=["198.51.100.20"]),
+            patch.object(healthcheck, "open_socks4_tunnel", return_value=(tunnel, details)),
+            patch.object(healthcheck.ssl, "create_default_context", return_value=context),
+        ):
+            result = healthcheck.preflight_route(config, "media", 2.0)
+
+        context.wrap_socket.assert_called_once_with(tunnel, server_hostname="whatsapp.net")
+        self.assertEqual(result["tls_version"], "TLSv1.3")
+        self.assertEqual(result["cipher"], "TLS_AES_256_GCM_SHA384")
+        self.assertIn("certificate_sha256", result)
+        tunnel.close.assert_not_called()
+
+    def test_media_tls_failure_fails_closed_and_closes_tunnel(self) -> None:
+        config = self.socks_config("media")
+        tunnel = MagicMock()
+        context = MagicMock()
+        context.wrap_socket.side_effect = ssl.SSLCertVerificationError("untrusted")
+        with (
+            patch.object(healthcheck, "resolve_ipv4_addresses", return_value=["198.51.100.20"]),
+            patch.object(
+                healthcheck,
+                "open_socks4_tunnel",
+                return_value=(tunnel, {"mode": "socks4", "reply": "granted"}),
+            ),
+            patch.object(healthcheck.ssl, "create_default_context", return_value=context),
+            self.assertRaisesRegex(RuntimeError, "failed for every IPv4 candidate.*SSLCertVerificationError"),
+        ):
+            healthcheck.preflight_route(config, "media", 2.0)
+
+        tunnel.close.assert_called_once_with()
 
 
 class AdminStatsTests(unittest.TestCase):
@@ -589,6 +709,41 @@ class MainVMProbeTests(unittest.TestCase):
         self.assertEqual(tls.call_args_list[1].args[0], "127.0.0.1")
         stats.assert_called_once_with("/run/haproxy/admin.sock", 30.0, current_config)
         runtime.assert_called_once_with(current_config, "/run/haproxy/admin.sock", 30.0)
+
+
+class MainRoutesProbeTests(unittest.TestCase):
+    def test_routes_scope_checks_both_backend_route_contracts(self) -> None:
+        current_config = RoutePreflightTests.socks_config("media")
+        output = io.StringIO()
+        with (
+            patch.object(
+                sys,
+                "argv",
+                ["healthcheck.py", "--scope", "routes", "--config", "config.yaml"],
+            ),
+            patch.object(healthcheck, "load_config", return_value=current_config),
+            patch.object(healthcheck, "validate"),
+            patch.object(
+                healthcheck,
+                "preflight_route",
+                side_effect=lambda _config, backend, _timeout: {"mode": backend},
+            ) as preflight,
+            redirect_stdout(output),
+        ):
+            return_code = healthcheck.main()
+
+        self.assertEqual(return_code, 0)
+        self.assertEqual(
+            [check["name"] for check in json.loads(output.getvalue())["checks"]],
+            ["route_chat", "route_media"],
+        )
+        self.assertEqual(
+            preflight.call_args_list,
+            [
+                call(current_config, "chat", 2.0),
+                call(current_config, "media", 2.0),
+            ],
+        )
 
 
 if __name__ == "__main__":

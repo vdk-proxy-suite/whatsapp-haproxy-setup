@@ -10,6 +10,18 @@
 Схема совместима с рекомендацией официального проекта WhatsApp Proxy для
 неблагоприятных сетевых условий. VoIP официальным proxy не поддерживается.
 
+## Изменения версии 1.3.0
+
+- Добавлены независимые исходящие маршруты `routes.chat` и `routes.media`:
+  прежний `direct` либо локальный SOCKS4 bridge на `127.0.0.1`
+- HAProxy передаёт через SOCKS4 и рабочий трафик, и L4 health-check; если
+  bridge или его parent недоступен, backend закрывается без direct fallback
+- Новый `healthcheck.py --scope routes` проверяет SOCKS4 CONNECT до каждого
+  настроенного upstream. Для media дополнительно выполняется TLS handshake с
+  обычной проверкой CA и SNI `probes.media_upstream_host`
+- Отсутствующий `routes` или отдельный backend сохраняет прежний byte-for-byte
+  direct render и всю семантику runtime DNS, frontend и PROXY v1
+
 ## Изменения версии 1.2.1
 
 - Для каждого hostname-upstream HAProxy использует три независимых DNS-view:
@@ -51,7 +63,7 @@
 ## Быстрый запуск
 
 ```bash
-unzip whatsapp-haproxy-setup-standalone-1.2.1.zip
+unzip whatsapp-haproxy-setup-standalone-1.3.0.zip
 cd whatsapp-haproxy-setup
 cp config.example.yaml config.yaml
 nano config.yaml
@@ -78,6 +90,48 @@ sudo ./setuphaproxy.sh 3  # systemd start и VM-side health-check
 sudo ./setuphaproxy.sh all --config /secure/path/whatsapp-proxy.yaml
 ```
 
+## Исходящие маршруты
+
+По умолчанию chat и media подключаются к upstream напрямую. Для отдельного
+backend можно включить локальный SOCKS4 egress:
+
+```yaml
+routes:
+  chat:
+    mode: "direct"
+  media:
+    mode: "socks4"
+    socks4:
+      host: "127.0.0.1"
+      port: 11081
+```
+
+`routes`, `routes.chat` и `routes.media` опциональны; отсутствие означает
+`direct`. В режиме `socks4` обязательны оба поля, `host` должен быть ровно
+`127.0.0.1`, а `port` — целым числом `1..65535`. HAProxy не принимает здесь
+логин или пароль: listener должен быть passwordless и доступен только через
+loopback. Его установка, upstream-аутентификация и failover принадлежат
+`3proxy-setup`; этот проект их не создаёт и не удаляет.
+
+SOCKS4 и `check-via-socks4` применяются вместе через backend-local
+`default-server`. Поэтому при отказе bridge обычные соединения и health-check
+не обходят его напрямую. Chat сохраняет обязательный PROXY v1, media остаётся
+raw TCP passthrough без PROXY header.
+
+При `all` setup выполняет route preflight до остановки HAProxy и повторяет его
+перед записью нового конфига. Отдельный step 2 также проверяет route до мутаций.
+Его можно запустить отдельно:
+
+```bash
+sudo python3 tools/healthcheck.py --scope routes --config config.yaml
+```
+
+Direct backend только отмечается как не требующий отдельного preflight. Для
+SOCKS4 preflight получает IPv4-кандидаты через системный resolver VM и пробует
+CONNECT к ним; media считается рабочим только после проверенного TLS handshake
+через созданный tunnel. Полные три DNS-view и все runtime slots затем проверяет
+VM-side healthcheck запущенного HAProxy.
+
 ## Runtime DNS-ротация upstream
 
 HAProxy переразрешает `probes.chat_upstream_host` и
@@ -87,6 +141,8 @@ HAProxy переразрешает `probes.chat_upstream_host` и
 ответ: у каждого view собственная группа server slots, а L4 health-check
 выбирает реально доступные с VM адреса. Если список DNS-серверов VM изменился,
 HAProxy нужно reload/restart. `/etc/hosts` в этом маршруте не используется.
+При SOCKS4-маршруте DNS по-прежнему выполняет HAProxy на VM, а bridge получает
+уже выбранный IPv4: это не SOCKS4a и не DNS-view страны upstream proxy.
 
 Для каждого DNS-upstream действует следующая семантика:
 
@@ -131,8 +187,10 @@ HAProxy нужно reload/restart. `/etc/hosts` в этом маршруте н�
 
 Setup не меняет cloud security group и не подключает DDoS-защиту. Для
 публичного сервиса разрешите ingress TCP только на `443` и `587`. SSH должен
-быть ограничен отдельно. VM нужен исходящий TCP к `g.whatsapp.net:5222` и
-`whatsapp.net:443`, а также DNS-доступ к resolver VM, `1.1.1.1`, `1.0.0.1`,
+быть ограничен отдельно. Direct backend требует исходящий TCP к своему
+WhatsApp upstream; SOCKS4 backend требует работоспособный локальный bridge и
+его собственный egress к parent proxy. VM также нужен DNS-доступ к resolver VM,
+`1.1.1.1`, `1.0.0.1`,
 `8.8.8.8` и `8.8.4.4` на UDP/TCP `53`. Если firewall не поддерживает
 DNS-правила, используйте подходящие общие egress-правила.
 
@@ -204,3 +262,5 @@ HAProxy, но намеренно не запускает глобальный `a
 - Официальная HAProxy-схема: <https://github.com/WhatsApp/proxy/blob/main/proxy/src/proxy_config.cfg>
 - Runtime DNS HAProxy 2.8: <https://docs.haproxy.org/2.8/configuration.html#5.3.2>
 - HAProxy `server-template`: <https://docs.haproxy.org/2.8/configuration.html#server-template>
+- HAProxy `socks4`: <https://docs.haproxy.org/2.8/configuration.html#5.2-socks4>
+- HAProxy `check-via-socks4`: <https://docs.haproxy.org/2.8/configuration.html#5.2-check-via-socks4>

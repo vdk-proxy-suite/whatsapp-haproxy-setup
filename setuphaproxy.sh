@@ -53,6 +53,8 @@ run_step() {
 
 case "$ACTION" in
   all)
+    echo "==> Preflighting configured backend routes before stopping HAProxy"
+    python3 "$BASE_DIR/tools/healthcheck.py" --scope routes --config "$CONFIG"
     run_step 00
     rollback_armed=1
     run_step 01

@@ -19,6 +19,8 @@ DNS_RESOLVERS = (
     ("cloudflare", "whatsapp_dns_cloudflare"),
     ("google", "whatsapp_dns_google"),
 )
+ROUTE_BACKENDS = ("chat", "media")
+SOCKS4_LOOPBACK_HOST = "127.0.0.1"
 
 
 def load_config(path: str) -> dict[str, Any]:
@@ -45,6 +47,89 @@ def need_int(config: dict[str, Any], path: str, minimum: int = 1, maximum: int |
     if value < minimum or (maximum is not None and value > maximum):
         raise ValueError(f"{path} is outside the allowed range")
     return value
+
+
+def get_backend_route(config: dict[str, Any], backend: str) -> dict[str, Any]:
+    if backend not in ROUTE_BACKENDS:
+        raise ValueError(f"unsupported backend route: {backend}")
+    if "routes" not in config:
+        return {"mode": "direct"}
+    routes = config["routes"]
+    if not isinstance(routes, dict):
+        raise ValueError("routes must be a mapping")
+    if backend not in routes:
+        return {"mode": "direct"}
+    route = routes[backend]
+    if not isinstance(route, dict):
+        raise ValueError(f"routes.{backend} must be a mapping")
+    return route
+
+
+def validate_routes(config: dict[str, Any]) -> None:
+    if "routes" not in config:
+        return
+    routes = config["routes"]
+    if not isinstance(routes, dict):
+        raise ValueError("routes must be a mapping")
+
+    unknown_backends = [str(key) for key in routes if key not in ROUTE_BACKENDS]
+    if unknown_backends:
+        raise ValueError(f"routes contains unsupported backends: {', '.join(unknown_backends)}")
+
+    for backend in ROUTE_BACKENDS:
+        if backend not in routes:
+            continue
+        route = get_backend_route(config, backend)
+        unknown_route_keys = [str(key) for key in route if key not in {"mode", "socks4"}]
+        if unknown_route_keys:
+            raise ValueError(
+                f"routes.{backend} contains unsupported keys: {', '.join(unknown_route_keys)}"
+            )
+        if "mode" not in route:
+            raise ValueError(f"routes.{backend}.mode is required")
+        mode = route["mode"]
+        if not isinstance(mode, str) or mode not in {"direct", "socks4"}:
+            raise ValueError(f"routes.{backend}.mode must be direct or socks4")
+
+        if mode == "direct":
+            if "socks4" in route:
+                raise ValueError(f"routes.{backend}.socks4 is only valid in socks4 mode")
+            continue
+
+        if "socks4" not in route:
+            raise ValueError(f"routes.{backend}.socks4 is required in socks4 mode")
+        socks4 = route["socks4"]
+        if not isinstance(socks4, dict):
+            raise ValueError(f"routes.{backend}.socks4 must be a mapping")
+        missing_socks4_keys = [key for key in ("host", "port") if key not in socks4]
+        if missing_socks4_keys:
+            raise ValueError(
+                f"routes.{backend}.socks4 is missing keys: {', '.join(missing_socks4_keys)}"
+            )
+        unknown_socks4_keys = [str(key) for key in socks4 if key not in {"host", "port"}]
+        if unknown_socks4_keys:
+            raise ValueError(
+                f"routes.{backend}.socks4 contains unsupported keys: "
+                f"{', '.join(unknown_socks4_keys)}"
+            )
+        if socks4["host"] != SOCKS4_LOOPBACK_HOST:
+            raise ValueError(
+                f"routes.{backend}.socks4.host must be exactly {SOCKS4_LOOPBACK_HOST}"
+            )
+        port = socks4["port"]
+        if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+            raise ValueError(f"routes.{backend}.socks4.port must be an integer from 1 to 65535")
+
+        upstream_host = str(get_path(config, f"probes.{backend}_upstream_host")).strip()
+        try:
+            upstream_ip = ipaddress.ip_address(upstream_host)
+        except ValueError:
+            pass
+        else:
+            if not isinstance(upstream_ip, ipaddress.IPv4Address):
+                raise ValueError(
+                    f"probes.{backend}_upstream_host must resolve to IPv4 in socks4 mode"
+                )
 
 
 def validate(config: dict[str, Any], reject_example: bool = False) -> None:
@@ -87,7 +172,11 @@ def validate(config: dict[str, Any], reject_example: bool = False) -> None:
         "probes.timeout_seconds", "probes.chat_upstream_port", "probes.media_upstream_port",
     ]
     for path in integer_paths:
-        need_int(config, path)
+        maximum = 65535 if path in {
+            "probes.chat_upstream_port",
+            "probes.media_upstream_port",
+        } else None
+        need_int(config, path, maximum=maximum)
     if need_int(config, "limits.per_ip_connections") > need_int(config, "limits.global_connections"):
         raise ValueError("per-IP connection limit cannot exceed the global limit")
 
@@ -107,6 +196,7 @@ def validate(config: dict[str, Any], reject_example: bool = False) -> None:
     for path in ["probes.admin_socket", "probes.chat_upstream_host", "probes.media_upstream_host"]:
         if not str(get_path(config, path)).strip():
             raise ValueError(f"{path} cannot be empty")
+    validate_routes(config)
 
 
 def uses_runtime_dns(host: Any) -> bool:
@@ -130,11 +220,24 @@ def render_backend_servers(name: str, host: Any, port: Any) -> list[str]:
     ]
 
 
+def render_route_server_options(config: dict[str, Any], backend: str) -> str:
+    route = get_backend_route(config, backend)
+    if route["mode"] == "direct":
+        return ""
+    socks4 = route["socks4"]
+    return (
+        f" socks4 {socks4['host']}:{socks4['port']}"
+        " check-via-socks4"
+    )
+
+
 def render_haproxy(config: dict[str, Any]) -> str:
     validate(config)
     g = lambda path: get_path(config, path)
     chat_host = g("probes.chat_upstream_host")
     media_host = g("probes.media_upstream_host")
+    chat_route_options = render_route_server_options(config, "chat")
+    media_route_options = render_route_server_options(config, "media")
     uses_dns = uses_runtime_dns(chat_host) or uses_runtime_dns(media_host)
     resolver_lines: list[str] = []
     if uses_dns:
@@ -237,7 +340,11 @@ def render_haproxy(config: dict[str, Any]) -> str:
         "",
         "backend whatsapp_chat",
         "    balance leastconn",
-        "    default-server check inter 10s fastinter 2s downinter 30s rise 1 fall 2 observe layer4 send-proxy",
+        (
+            "    default-server check inter 10s fastinter 2s downinter 30s "
+            "rise 1 fall 2 observe layer4 send-proxy"
+            f"{chat_route_options}"
+        ),
         *render_backend_servers("g_whatsapp_net_5222", chat_host, g("probes.chat_upstream_port")),
         "",
         "frontend whatsapp_media",
@@ -249,7 +356,11 @@ def render_haproxy(config: dict[str, Any]) -> str:
         "",
         "backend whatsapp_media",
         "    balance leastconn",
-        "    default-server check inter 10s fastinter 2s downinter 30s rise 1 fall 2 observe layer4",
+        (
+            "    default-server check inter 10s fastinter 2s downinter 30s "
+            "rise 1 fall 2 observe layer4"
+            f"{media_route_options}"
+        ),
         *render_backend_servers("whatsapp_net_443", media_host, g("probes.media_upstream_port")),
         "",
     ]

@@ -7,6 +7,8 @@ CONFIG="$BASE_DIR/config.yaml"
 source "$BASE_DIR/lib/common.sh"
 
 python3 "$BASE_DIR/tools/config.py" validate --config "$CONFIG" --reject-example
+echo "==> Preflighting configured backend routes"
+python3 "$BASE_DIR/tools/healthcheck.py" --scope routes --config "$CONFIG"
 public_ip="$(cfg_get server.public_ip)"
 regen="$(cfg_get certificate.regenerate_on_setup)"
 ssl_dir=/etc/haproxy/ssl

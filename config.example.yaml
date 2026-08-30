@@ -10,6 +10,17 @@ ports:
   chat: 443
   media: 587
 
+# Optional per-backend egress. Missing routes/backends are direct. Uncomment
+# only after the local-only passwordless SOCKS4 bridge is listening.
+# routes:
+#   chat:
+#     mode: "direct"
+#   media:
+#     mode: "socks4"
+#     socks4:
+#       host: "127.0.0.1"
+#       port: 11081
+
 access:
   # Empty means public access. CIDRs may be added for a private deployment.
   allowed_cidrs: []

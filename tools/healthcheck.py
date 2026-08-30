@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from config import get_path, load_config, validate  # noqa: E402
+from config import get_backend_route, get_path, load_config, validate  # noqa: E402
 
 
 DNS_RESOLVER_VIEWS = ("system", "cloudflare", "google")
@@ -74,6 +74,121 @@ def tls_connect(host: str, port: int, sni: str, timeout: float, verify: bool) ->
                 "certificate_subject": cert.get("subject") if cert else None,
                 "certificate_san": cert.get("subjectAltName") if cert else None,
             }
+
+
+def resolve_ipv4_addresses(host: str, port: int) -> list[str]:
+    try:
+        literal = ipaddress.ip_address(host)
+    except ValueError:
+        literal = None
+    if literal is not None:
+        if not isinstance(literal, ipaddress.IPv4Address) or literal.is_unspecified:
+            raise RuntimeError(f"upstream {host!r} is not a usable IPv4 address")
+        return [str(literal)]
+
+    addresses: list[str] = []
+    for _family, _socktype, _proto, _canonname, sockaddr in socket.getaddrinfo(
+        host,
+        port,
+        socket.AF_INET,
+        socket.SOCK_STREAM,
+    ):
+        address = str(ipaddress.IPv4Address(sockaddr[0]))
+        if address not in addresses:
+            addresses.append(address)
+    if not addresses:
+        raise RuntimeError(f"upstream {host!r} has no IPv4 address")
+    return addresses
+
+
+def _receive_exact(sock: socket.socket, size: int) -> bytes:
+    result = bytearray()
+    while len(result) < size:
+        chunk = sock.recv(size - len(result))
+        if not chunk:
+            raise ConnectionError("SOCKS4 proxy closed the connection during handshake")
+        result.extend(chunk)
+    return bytes(result)
+
+
+def open_socks4_tunnel(
+    proxy_host: str,
+    proxy_port: int,
+    target_ipv4: str,
+    target_port: int,
+    timeout: float,
+) -> tuple[socket.socket, dict[str, Any]]:
+    request = (
+        b"\x04\x01"
+        + target_port.to_bytes(2, "big")
+        + socket.inet_aton(target_ipv4)
+        + b"HAProxy\x00"
+    )
+    sock = socket.create_connection((proxy_host, proxy_port), timeout=timeout)
+    try:
+        sock.settimeout(timeout)
+        sock.sendall(request)
+        response = _receive_exact(sock, 8)
+        if response[0] != 0:
+            raise RuntimeError(f"invalid SOCKS4 response version: {response[0]}")
+        if response[1] != 0x5A:
+            raise RuntimeError(f"SOCKS4 CONNECT was rejected with code 0x{response[1]:02x}")
+        return sock, {
+            "mode": "socks4",
+            "proxy": [proxy_host, proxy_port],
+            "target": [target_ipv4, target_port],
+            "reply": "granted",
+        }
+    except BaseException:
+        sock.close()
+        raise
+
+
+def preflight_route(config: dict[str, Any], backend: str, timeout: float) -> dict[str, Any]:
+    route = get_backend_route(config, backend)
+    if route["mode"] == "direct":
+        return {"mode": "direct", "preflight": "not_required"}
+
+    upstream_host = str(get_path(config, f"probes.{backend}_upstream_host")).strip()
+    upstream_port = int(get_path(config, f"probes.{backend}_upstream_port"))
+    socks4 = route["socks4"]
+    proxy_host = str(socks4["host"])
+    proxy_port = int(socks4["port"])
+    failures: list[str] = []
+    addresses = resolve_ipv4_addresses(upstream_host, upstream_port)
+    for address in addresses:
+        tunnel: socket.socket | None = None
+        try:
+            tunnel, details = open_socks4_tunnel(
+                proxy_host,
+                proxy_port,
+                address,
+                upstream_port,
+                timeout,
+            )
+            if backend == "media":
+                context = ssl.create_default_context()
+                with context.wrap_socket(
+                    tunnel,
+                    server_hostname=upstream_host.rstrip("."),
+                ) as tls:
+                    der = tls.getpeercert(binary_form=True)
+                    details.update({
+                        "tls_version": tls.version(),
+                        "cipher": tls.cipher()[0] if tls.cipher() else None,
+                        "certificate_sha256": hashlib.sha256(der).hexdigest(),
+                    })
+                    tunnel = None
+            return details
+        except Exception as exc:
+            failures.append(f"{address}: {type(exc).__name__}: {exc}")
+        finally:
+            if tunnel is not None:
+                tunnel.close()
+    raise RuntimeError(
+        f"SOCKS4 route for {backend} failed for every IPv4 candidate: "
+        + "; ".join(failures)
+    )
 
 
 def command(args: list[str]) -> dict[str, Any]:
@@ -473,7 +588,7 @@ def limit_smoke(host: str, port: int, count: int, timeout: float) -> dict[str, A
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--scope", choices=("vm", "e2e", "limits"), required=True)
+    parser.add_argument("--scope", choices=("vm", "e2e", "limits", "routes"), required=True)
     parser.add_argument("--config", required=True)
     parser.add_argument("--host")
     parser.add_argument("--json-out")
@@ -503,8 +618,14 @@ def main() -> int:
     elif args.scope == "e2e":
         report.check("proxy_chat_tls", lambda: tls_connect(target, int(g("ports.chat")), target, timeout, False))
         report.check("proxy_media_tls", lambda: tls_connect(target, int(g("ports.media")), str(g("probes.media_upstream_host")), timeout, True))
-    else:
+    elif args.scope == "limits":
         report.check("per_ip_connection_limit", lambda: limit_smoke(target, int(g("ports.chat")), int(g("limits.per_ip_connections")), timeout), required=False)
+    else:
+        for backend in ("chat", "media"):
+            report.check(
+                f"route_{backend}",
+                lambda backend=backend: preflight_route(config, backend, timeout),
+            )
 
     result = report.finish()
     rendered = json.dumps(result, ensure_ascii=False, indent=2)
