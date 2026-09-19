@@ -1,14 +1,20 @@
 # Standalone HAProxy proxy for WhatsApp
 
-Нативный setup для Ubuntu 24.04 без Docker. Он устанавливает HAProxy из
-репозитория Ubuntu и по умолчанию поднимает два публичных TCP-порта:
+Нативный setup для Ubuntu 24.04 без Docker. Он устанавливает
+[HAProxy](https://github.com/haproxy/haproxy) из репозитория Ubuntu и по умолчанию поднимает два публичных TCP-порта:
 
 - `443`: TLS termination и передача chat-трафика в `g.whatsapp.net:5222` с
   корректным PROXY header
 - `587`: прозрачная передача media-трафика в `whatsapp.net:443`
 
-Схема совместима с рекомендацией официального проекта WhatsApp Proxy для
+Схема совместима с рекомендацией официального проекта
+[WhatsApp Proxy](https://github.com/WhatsApp/proxy) для
 неблагоприятных сетевых условий. VoIP официальным proxy не поддерживается.
+
+## Изменения версии 1.4.1
+
+- В шапку README добавлены ссылки на оригинальные репозитории WhatsApp Proxy
+  и HAProxy
 
 ## Изменения версии 1.4.0
 
@@ -77,7 +83,7 @@
 ## Быстрый запуск
 
 ```bash
-unzip whatsapp-haproxy-setup-standalone-1.4.0.zip
+unzip whatsapp-haproxy-setup-standalone-1.4.1.zip
 cd whatsapp-haproxy-setup
 cp config.example.yaml config.yaml
 nano config.yaml
